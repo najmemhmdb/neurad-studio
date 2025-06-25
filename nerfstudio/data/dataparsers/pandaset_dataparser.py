@@ -46,7 +46,7 @@ LIDAR_NAME_TO_INDEX = {
     "PandarGT": 1,
 }
 
-PANDASET_SEQ_LEN = 80
+PANDASET_SEQ_LEN = 100 # 80
 EXTRINSICS_FILE_PATH = os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml")
 MAX_RELECTANCE_VALUE = 255.0
 
@@ -57,7 +57,7 @@ ALLOWED_RIGID_CLASSES = (
     "Semi-truck",
     "Towed Object",
     "Motorcycle",
-    "Other Vehicle - Construction Vehicle",
+    "Other Vehicle - Condstruction Vehicle",
     "Other Vehicle - Uncommon",
     "Other Vehicle - Pedicab",
     "Emergency Vehicle",
@@ -214,18 +214,21 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             # the pose information in self.sequence.lidar.poses is not correct, so we compute it from the camera pose and extrinsics
             # the lidar scans are synced such that the middle of a scan is at the same time as the front camera image
-            front_cam = self.sequence.camera["front_camera"]
-            front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
-            front_cam_extrinsics = self.extrinsics["front_camera"]
-            front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
-            front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
-            l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
-            l2w = torch.from_numpy(front_cam2w @ l2front_cam)
+            #################################### commented because our l2w was correct ####################################
+            # front_cam = self.sequence.camera["front_camera"]
+            # front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
+            # front_cam_extrinsics = self.extrinsics["front_camera"]
+            # front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
+            # front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
+            # l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
+            # l2w = torch.from_numpy(front_cam2w @ l2front_cam)
+            # time = front_cam.timestamps[i]
+            l2w = torch.from_numpy(_pandaset_pose_to_matrix(self.sequence.lidar.poses[i]))
+            time = self.sequence.lidar.timestamps[i]
+
 
             # Load point cloud
             filename = self.sequence.lidar._data_structure[i]
-            # since we are using the front camera pose, we need to use the front camera timestamp
-            time = front_cam.timestamps[i]
 
             for lidar in self.config.lidars:
                 lidar_idx = LIDAR_NAME_TO_INDEX[lidar]
@@ -247,6 +250,7 @@ class PandaSet(ADDataParser):
             vertical_beam_divergence=VERTICAL_BEAM_DIVERGENCE,
             valid_lidar_distance_threshold=DUMMY_DISTANCE_VALUE / 2,
         )
+        
         return lidars, lidar_filenames
 
     def _read_lidars(self, lidars: Lidars, filepaths: List[Path]) -> List[torch.Tensor]:
@@ -264,53 +268,55 @@ class PandaSet(ADDataParser):
 
             # Load point cloud
             point_cloud = torch.from_numpy(read_point_cloud(filename))
-            point_cloud[:, 3] /= MAX_RELECTANCE_VALUE
+            # point_cloud[:, 3] /= MAX_RELECTANCE_VALUE
             if lidar_idx == LIDAR_NAME_TO_INDEX["Pandar64"]:
                 point_clouds_in_world.append(point_cloud[point_cloud[:, -1] == LIDAR_NAME_TO_INDEX["Pandar64"], :-1])
             points = point_cloud[:, :3]
             # transform points from world space to sensor space
             points = torch.hstack((points, torch.ones((points.shape[0], 1))))
-            points = (torch.matmul(torch.linalg.inv(l2w), points.T).T)[:, :3]
-            point_cloud[:, :3] = points
+            ############################################# commented ##########################################
+            # points = (torch.matmul(torch.linalg.inv(l2w), points.T).T)[:, :3]
+            point_cloud[:, :3] = points[:, :3]
 
             # and adjust the point cloud timestamps accordingly
-            point_cloud[:, 4] -= lidar.times
+            # point_cloud[:, 4] -= lidar.times
 
             pc = point_cloud[point_cloud[:, -1] == lidar_idx, :-1]
             point_clouds.append(pc.float())
-
         assert len(point_clouds) == len(
             lidars
         ), f"Number of point clouds ({len(point_clouds)}) does not match number of lidars ({len(lidars)})"
 
-        if self.config.add_missing_points:
-            poses = lidars.lidar_to_worlds
-            times = lidars.times.squeeze(-1)
-
-            pc_without_ego_motion_comp = [
-                self._remove_ego_motion_compensation(pc, poses, times) for pc in point_clouds_in_world
-            ]
-            pc_without_ego_motion_comp = [
-                (self._add_channel_info(pc, dim=3, lidar_name="Pandar64"), pose)
-                for pc, pose in pc_without_ego_motion_comp
-            ]  # TODO: clean up to handle multiple lidars
-
-            # project back to joint lidar pose
-            pc_without_ego_motion_comp = [
-                (pc, torch.matmul(pose_utils.inverse(l2w.unsqueeze(0)).float(), pose_utils.to4x4(pc_poses).float()))
-                for (pc, pc_poses), l2w in zip(pc_without_ego_motion_comp, poses)
-            ]
-            missing_points = [
-                self._get_missing_points(pc, poses, "Pandar64") for pc, poses in pc_without_ego_motion_comp
-            ]
-            # drop channel info again
-            missing_points = [torch.cat([pc[:, :3], pc[:, 4:]], dim=-1) for pc in missing_points]
-            # subtracts lidar time
-            for pc, time in zip(missing_points, times):
-                pc[:, 4] -= time
-            # add missing points to point clouds
-            point_clouds = [torch.cat([pc, missing], dim=0) for pc, missing in zip(point_clouds, missing_points)]
-
+        # if self.config.add_missing_points:
+        #     poses = lidars.lidar_to_worlds
+        #     times = lidars.times.squeeze(-1)
+        #     pc_without_ego_motion_comp = [
+        #         self._remove_ego_motion_compensation(pc, poses, times) for pc in point_clouds_in_world
+        #     ]
+        #     ############################### commented due to an error #########################
+        #     pc_without_ego_motion_comp = [
+        #         (self._add_channel_info(pc, k, dim=3, lidar_name="Pandar64"), pose)
+        #         for k, (pc, pose) in enumerate(pc_without_ego_motion_comp)
+        #     ]  # TODO: clean up to handle multiple lidars
+        #     ############################### commented because our points are local #########################
+        #     # project back to joint lidar pose
+        #     pc_without_ego_motion_comp = [
+        #         (pc, torch.matmul(pose_utils.inverse(l2w.unsqueeze(0)).float(), pose_utils.to4x4(pc_poses).float()))
+        #         for (pc, pc_poses), l2w in zip(pc_without_ego_motion_comp, poses)
+        #     ]
+        #     missing_points = [
+        #         self._get_missing_points(pc, poses, "Pandar64") for pc, poses in pc_without_ego_motion_comp
+        #     ]
+        #     # # drop channel info again
+        #      ############################### commented due to an error in add_info_channel #########################
+        #     missing_points = [torch.cat([pc[:, :3], pc[:, 4:]], dim=-1) for pc in missing_points]
+        #     # subtracts lidar time
+        #     # print('before for')
+        #     # print(times.shape)
+        #     for pc, time in zip(missing_points, times):
+        #         pc[:, 4] -= time
+        #     # add missing points to point clouds
+        #     point_clouds = [torch.cat([pc, missing], dim=0) for pc, missing in zip(point_clouds, missing_points)]
         lidars.lidar_to_worlds = lidars.lidar_to_worlds.float()
 
         return point_clouds
@@ -391,7 +397,7 @@ class PandaSet(ADDataParser):
         self.extrinsics = yaml.load(open(EXTRINSICS_FILE_PATH, "r"), Loader=yaml.FullLoader)
         return super()._generate_dataparser_outputs(split)
 
-    def _add_channel_info(self, point_cloud: torch.Tensor, dim: int = -1, lidar_name: str = "") -> torch.Tensor:
+    def _add_channel_info(self, point_cloud: torch.Tensor, k: int, dim: int = -1, lidar_name: str = "") -> torch.Tensor:
         """Infer channel id from point cloud, and add it to the point cloud.
 
         Args:
@@ -402,21 +408,23 @@ class PandaSet(ADDataParser):
             channel_id is added to dim
         """
         # these are limits where channels are equally spaced
+        print(k, lidar_name)
         ELEV_HIGH_IDX = 5
         ELEV_LOW_IDX = -11
         ELEV_LOW_IDX_ABS = len(self.config.lidar_elevation_mapping[lidar_name]) + ELEV_LOW_IDX
-
+        # print(ELEV_LOW_IDX_ABS)
+        # print(torch.min(point_cloud[:, 2]), torch.max(point_cloud[:, 2]))
         dist = torch.norm(point_cloud[:, :3], dim=-1)
+        # print('dist shape', dist.shape)
         elevation = torch.arcsin(point_cloud[:, 2] / dist)
         elevation = torch.rad2deg(elevation)
-
+        # print((self.config.lidar_elevation_mapping[lidar_name][ELEV_LOW_IDX_ABS] - 0.2),
+            #   (self.config.lidar_elevation_mapping[lidar_name][ELEV_HIGH_IDX] + 0.2))
         middle_elev_mask = (elevation < (self.config.lidar_elevation_mapping[lidar_name][ELEV_HIGH_IDX] + 0.2)) & (
             elevation > (self.config.lidar_elevation_mapping[lidar_name][ELEV_LOW_IDX_ABS] - 0.2)
         )
         middle_elev = elevation[middle_elev_mask]
-
         histc, bin_edges = torch.histogram(middle_elev, bins=2000)
-
         # channels should be equally spaced
         expected_channel_edges = (bin_edges[-1] - bin_edges[0]) / 49 * torch.arange(50) + bin_edges[0]
 
@@ -430,6 +438,7 @@ class PandaSet(ADDataParser):
         empty_bin = []
         empty_bins_edges = []
         for i in range(len(histc)):
+            
             if histc[i] == 0:
                 empty_bin.append(i)
             else:
@@ -437,7 +446,6 @@ class PandaSet(ADDataParser):
                     empty_bins.append(empty_bin)
                     empty_bins_edges.append((bin_edges[empty_bin[0]], bin_edges[empty_bin[-1] + 1]))
                     empty_bin = []
-
         # find channel edges, use first expected for init
         found_channel_edges = [expected_channel_edges[0].tolist()]
         empty_bins_edges = torch.tensor(empty_bins_edges)

@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
-
+import time
 import torch
 from rich import box, style
 from rich.panel import Panel
@@ -297,6 +297,7 @@ class Trainer:
         with TimeWriter(writer, EventName.TOTAL_TRAIN_TIME):
             num_iterations = self.config.max_num_iterations
             step = 0
+            start_time = time.time()
             for step in range(self._start_step, self._start_step + num_iterations):
                 while self.training_state == "paused":
                     time.sleep(0.01)
@@ -359,10 +360,15 @@ class Trainer:
                     self.save_checkpoint(step)
 
                 writer.write_out_storage()
-
+            
+        end_time = time.time()
         # save checkpoint at the end of training
         self.save_checkpoint(step)
-
+        hours = int((end_time - start_time) // 3600)
+        minutes = int((end_time - start_time) % 3600 // 60)
+        seconds = int((end_time - start_time) % 60)
+        print(f"Time taken for {num_iterations} iterations: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        
         # write out any remaining events (e.g., total train time)
         writer.write_out_storage()
 
