@@ -46,7 +46,7 @@ LIDAR_NAME_TO_INDEX = {
     "PandarGT": 1,
 }
 
-PANDASET_SEQ_LEN = 100 # 80
+PANDASET_SEQ_LEN = 80 # 80
 EXTRINSICS_FILE_PATH = os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml")
 MAX_RELECTANCE_VALUE = 255.0
 
@@ -215,16 +215,16 @@ class PandaSet(ADDataParser):
             # the pose information in self.sequence.lidar.poses is not correct, so we compute it from the camera pose and extrinsics
             # the lidar scans are synced such that the middle of a scan is at the same time as the front camera image
             #################################### commented because our l2w was correct ####################################
-            # front_cam = self.sequence.camera["front_camera"]
-            # front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
-            # front_cam_extrinsics = self.extrinsics["front_camera"]
-            # front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
-            # front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
-            # l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
-            # l2w = torch.from_numpy(front_cam2w @ l2front_cam)
-            # time = front_cam.timestamps[i]
-            l2w = torch.from_numpy(_pandaset_pose_to_matrix(self.sequence.lidar.poses[i]))
-            time = self.sequence.lidar.timestamps[i]
+            front_cam = self.sequence.camera["front_camera"]
+            front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
+            front_cam_extrinsics = self.extrinsics["front_camera"]
+            front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
+            front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
+            l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
+            l2w = torch.from_numpy(front_cam2w @ l2front_cam)
+            time = front_cam.timestamps[i]
+            # l2w = torch.from_numpy(_pandaset_pose_to_matrix(self.sequence.lidar.poses[i]))
+            # time = self.sequence.lidar.timestamps[i]
 
 
             # Load point cloud
@@ -275,11 +275,12 @@ class PandaSet(ADDataParser):
             # transform points from world space to sensor space
             points = torch.hstack((points, torch.ones((points.shape[0], 1))))
             ############################################# commented ##########################################
-            # points = (torch.matmul(torch.linalg.inv(l2w), points.T).T)[:, :3]
+            points = (torch.matmul(torch.linalg.inv(l2w), points.T).T)[:, :3]
+            
             point_cloud[:, :3] = points[:, :3]
 
             # and adjust the point cloud timestamps accordingly
-            # point_cloud[:, 4] -= lidar.times
+            point_cloud[:, 4] -= lidar.times
 
             pc = point_cloud[point_cloud[:, -1] == lidar_idx, :-1]
             point_clouds.append(pc.float())
