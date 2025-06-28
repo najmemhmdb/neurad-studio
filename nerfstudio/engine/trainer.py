@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
-
+import time
 import torch
 from rich import box, style
 from rich.panel import Panel
@@ -65,7 +65,7 @@ class MetricTrackerConfig(InstantiateConfig):
     higher_is_better: bool = True
     """Whether a higher value of the metric is better."""
     margin: float = 0.0
-    """Margin for comparison (0.1 = 10%)"""
+    """Margin for comparison (0.1 = 10%). Set to <0 to disable margin."""
 
 
 class MetricTracker:
@@ -76,9 +76,7 @@ class MetricTracker:
         self.best, self.latest = None, None
 
     def did_degrade(self, fallback: bool = False) -> bool:
-        if self.config.metric is None:
-            return False  # no metric to track
-        if (self.latest is None) or (self.best is None):
+        if (self.latest is None) or (self.best is None) or self.config.margin < 0:
             return fallback  # we can't tell
         # apply margin to the best value (to be robust to noise in the metric)
         best = self.best * (1 + (-self.config.margin if self.config.higher_is_better else self.config.margin))
@@ -89,10 +87,10 @@ class MetricTracker:
 
     def update(self, metrics: Dict[str, float]) -> None:
         self.latest = metrics.get(self.config.metric, None) if self.config.metric else None
-        if self.latest is None:
-            return
         if isinstance(self.latest, torch.Tensor):
             self.latest = self.latest.item()
+        if self.latest is None:
+            return
         if self.best is None:
             self.best = self.latest
         elif self._is_new_better(self.best, self.latest):
@@ -297,6 +295,7 @@ class Trainer:
         with TimeWriter(writer, EventName.TOTAL_TRAIN_TIME):
             num_iterations = self.config.max_num_iterations
             step = 0
+            start_time = time.time()
             for step in range(self._start_step, self._start_step + num_iterations):
                 while self.training_state == "paused":
                     time.sleep(0.01)
@@ -359,10 +358,15 @@ class Trainer:
                     self.save_checkpoint(step)
 
                 writer.write_out_storage()
-
+            
+        end_time = time.time()
         # save checkpoint at the end of training
         self.save_checkpoint(step)
-
+        hours = int((end_time - start_time) // 3600)
+        minutes = int((end_time - start_time) % 3600 // 60)
+        seconds = int((end_time - start_time) % 60)
+        print(f"Time taken for {num_iterations} iterations: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        
         # write out any remaining events (e.g., total train time)
         writer.write_out_storage()
 
