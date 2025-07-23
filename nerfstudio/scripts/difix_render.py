@@ -89,6 +89,10 @@ def _render_trajectory_video(
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
     render_nearest_camera=False,
     check_occlusions: bool = False,
+    enabled_difix: bool = False,
+    difix_ref: bool = False,
+    ref_image: Literal["train", "prev_rendered", "None"] = "None",
+    camera_idx_ref: int = 0,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -113,8 +117,17 @@ def _render_trajectory_video(
     fps = len(cameras) / seconds
 
     # load difix pipeline
-    pipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
-    pipe.to("cuda")
+    if enabled_difix:
+        assert pipeline.datamanager.train_dataset is not None
+        train_dataset = pipeline.datamanager.train_dataset
+        train_cameras = train_dataset.cameras.to(pipeline.device)
+        num_frames = len(train_cameras) // 6
+        print(f'number of frames {num_frames}')
+        if difix_ref:
+            pipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
+        else:
+            pipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
+        pipe.to("cuda")
 
     progress = Progress(
         TextColumn(":movie_camera: Rendering :movie_camera:"),
@@ -148,8 +161,9 @@ def _render_trajectory_video(
             train_dataset = pipeline.datamanager.train_dataset
             train_cameras = train_dataset.cameras.to(pipeline.device)
         else:
-            train_dataset = None
-            train_cameras = None
+            if not enabled_difix:
+                train_dataset = None
+                train_cameras = None
 
         with progress:
             for camera_idx in progress.track(range(cameras.size), description=""):
@@ -250,69 +264,86 @@ def _render_trajectory_video(
                             .cpu()
                             .numpy()
                         )
+                    if not enabled_difix:
+                        render_image.append(output_image)
+                        continue
+                    else:
+                        if difix_ref and ref_image == "train":
+                            # find nearest camera
+                            max_dist, max_idx = -1, -1
+                            true_max_dist, true_max_idx = -1, -1
+                            cam_pos = cameras[camera_idx].camera_to_worlds[:, 3].cpu()
+                            cam_quat = tf.SO3.from_matrix(cameras[camera_idx].camera_to_worlds[:3, :3].numpy(force=True)).wxyz
+                        
+                            # extract front cameras 
+                            selected_cameras = train_cameras[camera_idx_ref*num_frames:(camera_idx_ref+1)*num_frames]
+                            for i in range(len(selected_cameras)):
+                                train_cam_pos = selected_cameras[i].camera_to_worlds[:, 3].cpu()
+                                q = tf.SO3.from_matrix(selected_cameras[i].camera_to_worlds[:3, :3].numpy(force=True)).wxyz
+                                # calculate distance between two quaternions
+                                rot_dist = 1 - np.dot(q, cam_quat) ** 2
+                                pos_dist = torch.norm(train_cam_pos - cam_pos)
+                                dist = 0.3 * rot_dist + 0.7 * pos_dist
+                                if true_max_dist == -1 or dist < true_max_dist:
+                                    true_max_dist = dist
+                                    true_max_idx = i
+                            if max_idx == -1:
+                                max_idx = true_max_idx
 
-                    # find nearest camera
-                    max_dist, max_idx = -1, -1
-                    true_max_dist, true_max_idx = -1, -1
-                    print("find_nearest_camera")
-                    assert pipeline.datamanager.train_dataset is not None
-                    train_dataset = pipeline.datamanager.train_dataset
-                    train_cameras = train_dataset.cameras.to(pipeline.device)
-                    cam_pos = cameras[camera_idx].camera_to_worlds[:, 3].cpu()
-                    cam_quat = tf.SO3.from_matrix(cameras[camera_idx].camera_to_worlds[:3, :3].numpy(force=True)).wxyz
-                    
-                    # extract front cameras 
-                    front_cameras = train_cameras[:40]
-                    for i in range(len(front_cameras)):
-                        train_cam_pos = front_cameras[i].camera_to_worlds[:, 3].cpu()
-                        q = tf.SO3.from_matrix(front_cameras[i].camera_to_worlds[:3, :3].numpy(force=True)).wxyz
-                        # calculate distance between two quaternions
-                        rot_dist = 1 - np.dot(q, cam_quat) ** 2
-                        pos_dist = torch.norm(train_cam_pos - cam_pos)
-                        dist = 0.3 * rot_dist + 0.7 * pos_dist
-                        if true_max_dist == -1 or dist < true_max_dist:
-                            true_max_dist = dist
-                            true_max_idx = i
-                    if max_idx == -1:
-                        max_idx = true_max_idx
+                            ref_img = train_dataset.get_image_float32(camera_idx_ref*num_frames+max_idx)
+                            
+                            # height = cameras.image_height[0] * 0.5                    # maintain the resolution of the ref_img to calculate the width from the height
+                            # width = int(ref_img.shape[1] * (height / ref_img.shape[0])) * 0.5
+                            ref_img = torch.nn.functional.interpolate(
+                                ref_img.permute(2, 0, 1)[None], size=(540, 960)
+                            )[0].permute(1, 2, 0)
+                            ref_img = (
+                                colormaps.apply_colormap(
+                                    image=ref_img,
+                                    colormap_options=colormap_options,
+                                )
+                                .cpu()
+                                .numpy()
+                            )
+                            import PIL.Image
+                            ref_img = PIL.Image.fromarray((ref_img * 255).clip(0, 255).astype('uint8'))
+                            ref_img.save(f"ref_img_{max_idx}.png")
+                            refined_image = pipe("remove degradation", image=output_image, ref_image=ref_img,
+                                            num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+                        elif difix_ref and ref_image == "prev_rendered":
+                            if camera_idx == 0:
+                                ref_img = train_dataset.get_image_float32(camera_idx_ref*num_frames)
+                                # height = cameras.image_height[0] * 0.5                    # maintain the resolution of the ref_img to calculate the width from the height
+                                # width = int(ref_img.shape[1] * (height / ref_img.shape[0])) * 0.5
+                                resized_image = torch.nn.functional.interpolate(
+                                    ref_img.permute(2, 0, 1)[None], size=(540, 960)
+                                )[0].permute(1, 2, 0)
+                                ref_img = (
+                                    colormaps.apply_colormap(
+                                        image=resized_image,
+                                        colormap_options=colormap_options,
+                                    )
+                                    .cpu()
+                                    .numpy()
+                                )
+                                # import PIL.Image
+                                # print(ref_img[100, 100, :])
+                                # ref_img = PIL.Image.fromarray((ref_img * 255).clip(0, 255).astype('uint8'))
+                                # ref_img.save("ref_img.png")
 
-                    ref_img = train_dataset.get_image_float32(max_idx)
-                    # height = cameras.image_height[0] * 0.5                    # maintain the resolution of the ref_img to calculate the width from the height
-                    # width = int(ref_img.shape[1] * (height / ref_img.shape[0])) * 0.5
-                    ref_img = torch.nn.functional.interpolate(
-                        ref_img.permute(2, 0, 1)[None], size=(540, 960)
-                    )[0].permute(1, 2, 0)
-                    ref_img = (
-                        colormaps.apply_colormap(
-                            image=ref_img,
-                            colormap_options=colormap_options,
-                        )
-                        .cpu()
-                        .numpy()
-                    )
-                    
-                    # if len(render_image) == 0:
-                    #     ref_img = train_dataset.get_image_float32(0)
-                    #     # height = cameras.image_height[0] * 0.5                    # maintain the resolution of the ref_img to calculate the width from the height
-                    #     # width = int(ref_img.shape[1] * (height / ref_img.shape[0])) * 0.5
-                    #     resized_image = torch.nn.functional.interpolate(
-                    #         ref_img.permute(2, 0, 1)[None], size=(540, 960)
-                    #     )[0].permute(1, 2, 0)
-                    #     ref_img = (
-                    #         colormaps.apply_colormap(
-                    #             image=resized_image,
-                    #             colormap_options=colormap_options,
-                    #         )
-                    #         .cpu()
-                    #         .numpy()
-                    #     )
+                            else:
+                                ref_img = prev_render_image
+                                # import PIL.Image
+                                # print(ref_img[100, 100, :])
+                                # ref_img = PIL.Image.fromarray((ref_img * 255).clip(0, 255).astype('uint8'))
+                                # ref_img.save("ref_img_prev.png")
 
-                    # else:
-                    #     ref_img = render_image[-1]
-                    refined_image = pipe("remove degradation", image=output_image, ref_image=ref_img,
-                                          num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-
-                    render_image.append(refined_image)
+                            refined_image = pipe("remove degradation", image=output_image, ref_image=ref_img,
+                                                num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+                        if not difix_ref and ref_image == "None":
+                            refined_image = pipe("remove degradation", image=output_image,
+                                            num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+                        render_image.append(refined_image)
 
 
                 # Add closest training image to the right of the rendered image
@@ -356,6 +387,7 @@ def _render_trajectory_video(
                             )
                         )
                     writer.add_image(render_image)
+                    prev_render_image = render_image
 
     table = Table(
         title=None,
@@ -523,7 +555,15 @@ class RenderCameraPath(BaseRender):
     """Filename of the camera path to render."""
     output_format: Literal["images", "video"] = "video"
     """How to save output data."""
-
+    enabled_difix: bool = False
+    """Whether to use difix."""
+    difix_ref: bool = False
+    """Whether to use difix reference image."""
+    ref_image: Literal["train", "prev_rendered", "None"] = "None"
+    """Whether to use closest train frame or prev_rendered frame as reference image."""
+    camera_idx_ref: int = 0
+    """Index of reference camera."""
+    
     def main(self) -> None:
         """Main function."""
         _, pipeline, _, _ = eval_setup(
@@ -580,6 +620,10 @@ class RenderCameraPath(BaseRender):
             colormap_options=self.colormap_options,
             render_nearest_camera=self.render_nearest_camera,
             check_occlusions=self.check_occlusions,
+            enabled_difix=self.enabled_difix,
+            difix_ref=self.difix_ref,
+            ref_image=self.ref_image,
+            camera_idx_ref=self.camera_idx_ref,
         )
 
         if (
@@ -615,6 +659,10 @@ class RenderCameraPath(BaseRender):
                 colormap_options=self.colormap_options,
                 render_nearest_camera=self.render_nearest_camera,
                 check_occlusions=self.check_occlusions,
+                enabled_difix=self.enabled_difix,
+                difix_ref=self.difix_ref,
+                ref_image=self.ref_image,
+                camera_idx_ref=self.camera_idx_ref
             )
 
             self.output_path = Path(str(left_eye_path.parent)[:-5] + ".mp4")
