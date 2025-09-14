@@ -22,6 +22,7 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple, Type, Union
+import json
 
 import numpy
 import torch
@@ -38,7 +39,7 @@ from nerfstudio.configs.base_config import InstantiateConfig
 from nerfstudio.engine.optimizers import OptimizerConfig
 from nerfstudio.engine.schedulers import SchedulerConfig
 from nerfstudio.utils import poses as pose_utils
-
+import os
 
 @dataclass
 class CameraOptimizerConfig(InstantiateConfig):
@@ -49,10 +50,10 @@ class CameraOptimizerConfig(InstantiateConfig):
     mode: Literal["off", "SO3xR3", "SE3"] = "off"
     """Pose optimization strategy to use. If enabled, we recommend SO3xR3."""
 
-    trans_l2_penalty: Union[Tuple, float] = 1e-2
+    trans_l2_penalty: Union[Tuple, float] = 0 #1e-2
     """L2 penalty on translation parameters."""
 
-    rot_l2_penalty: float = 1e-3
+    rot_l2_penalty: float = 0 #1e-3
     """L2 penalty on rotation parameters."""
 
     # tyro.conf.Suppress prevents us from creating CLI arguments for these fields.
@@ -128,13 +129,26 @@ class CameraOptimizer(nn.Module):
         if self.config.mode == "off":
             pass
         elif self.config.mode in ("SO3xR3", "SE3"):
-            self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
+            # self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
+            self.camera_count = 6
+            self.sequence_length = num_cameras // (self.camera_count + 1)
+            
+            self.ext_adjustment = torch.nn.Parameter(torch.zeros((self.camera_count, 6), device=device))
+            self.lidar_adjustment = torch.nn.Parameter(torch.zeros((self.sequence_length, 6), device=device))
+            self.lidar_adjustment.requires_grad_(False)
+            
+            self.step_counter = 0
+            os.makedirs(f"calib_results/save/", exist_ok=True)
         else:
             assert_never(self.config.mode)
 
-    def _get_pose_adjustment(self) -> Float[Tensor, "num_cameras 6"]:
+    def _get_ext_adjustment(self) -> Float[Tensor, "num_cameras*sequence_length 6"]:
         """Get the pose adjustment."""
-        return self.pose_adjustment
+        return self.ext_adjustment
+    
+    def _get_lidar_adjustment(self) -> Float[Tensor, "sequence_length 6"]:
+        """Get the pose adjustment."""
+        return self.lidar_adjustment
 
     def forward(
         self,
@@ -153,7 +167,50 @@ class CameraOptimizer(nn.Module):
         if self.config.mode == "off":
             pass
         elif self.config.mode == "SO3xR3":
-            outputs.append(exp_map_SO3xR3(self._get_pose_adjustment()[indices, :]))
+
+            self.step_counter += 1
+            ext_adjustments = self._get_ext_adjustment()
+            lidar_adjustments = self._get_lidar_adjustment()
+
+            # create mask for lidar and camera indices
+            mask_ext = indices < (self.sequence_length * self.camera_count)
+            mask_lidar = ~mask_ext
+
+            # allocate output
+            num_indices = len(indices)
+            output = torch.zeros((num_indices, 3, 4), device="cuda")
+
+            # --- Process the lidar indices
+            if mask_lidar.any():
+                # For these indices, we subtract camera count * sequence length
+                lidar_idx = indices[mask_lidar] - (self.sequence_length * self.camera_count)
+                # Gather the corresponding adjustments (assumes lidar_adjustments is indexable with a tensor)
+                lidar_inputs = lidar_adjustments[lidar_idx]
+                # Compute the mapping in batch
+                mapped_lidar = exp_map_SO3xR3(lidar_inputs)  # Expected shape: (B, 3, 4)
+                output[mask_lidar] = mapped_lidar
+
+
+            # --- Process camera indices in batch ---
+            if mask_ext.any():
+                # Compute indices for each adjustment type
+                ext_indices = indices[mask_ext] % self.camera_count
+                # Gather adjustments for each branch
+                ext_inputs = ext_adjustments[ext_indices]
+                ext_adj = exp_map_SO3xR3(ext_inputs)       # Expected shape: (B, 3, 4)
+                output[mask_ext] = ext_adj
+                    
+            outputs.append(output)
+
+            if self.step_counter % 2000 == 0 or self.step_counter == 1:
+                
+                # Convert tensor to a JSON-compatible format
+                pose_adjustment_list = exp_map_SO3xR3(self.ext_adjustment).detach().cpu().tolist()
+                # Save to a JSON file
+                path = f"calib_results/save"
+                with open(f"{path}/pose_adjustment{self.step_counter}.json", "w") as f:
+                    json.dump(pose_adjustment_list, f)
+
         elif self.config.mode == "SE3":
             outputs.append(exp_map_SE3(self._get_pose_adjustment()[indices, :]))
         else:
@@ -168,52 +225,72 @@ class CameraOptimizer(nn.Module):
         if len(outputs) == 0:
             # Note that using repeat() instead of tile() here would result in unnecessary copies.
             return torch.eye(4, device=self.device)[None, :3, :4].tile(indices.shape[0], 1, 1)
-        return functools.reduce(pose_utils.multiply, outputs)
+        return functools.reduce(pose_utils.multiply, outputs) # convert list of
+
 
     def apply_to_raybundle(self, raybundle: RayBundle) -> None:
         """Apply the pose correction to the raybundle"""
         if self.config.mode != "off":
-            correction_matrices = self(raybundle.camera_indices.squeeze())  # type: ignore
-            raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
-            raybundle.directions = (
-                torch.bmm(correction_matrices[:, :3, :3], raybundle.directions[..., None])
-                .squeeze()
-                .to(raybundle.origins)
-            )
+            with torch.cuda.amp.autocast(enabled=False):
+                s2w = raybundle.metadata["s2w"]
+                sensor2w = s2w.reshape(s2w.shape[0], 3, 4)
+                sensor2w_4x4 = pose_utils.to4x4(sensor2w)
+                correction_matrices = self(raybundle.camera_indices.squeeze())  # type: ignore
+                correction_matrices_4x4 = pose_utils.to4x4(correction_matrices)
+                R_s2w = sensor2w_4x4[:, :3, :3]
+                t_s2w = sensor2w_4x4[:, :3,  3]
+                R_corr = correction_matrices_4x4[:, :3, :3]
+                t_corr = correction_matrices_4x4[:, :3,  3]
+                dirs_w = raybundle.directions
+                origins_w = raybundle.origins
+                # world -> sensor
+                dirs_s = (R_s2w.transpose(1, 2) @ dirs_w.unsqueeze(-1)).squeeze(-1)
+                orig_s = (R_s2w.transpose(1, 2) @ (origins_w - t_s2w).unsqueeze(-1)).squeeze(-1)
+                # apply corr in sensor
+                dirs_s2 = (R_corr @ dirs_s.unsqueeze(-1)).squeeze(-1)
+                orig_s2 = (R_corr @ orig_s.unsqueeze(-1)).squeeze(-1) + t_corr
+                # back to world
+                dirs_w2 = (R_s2w @ dirs_s2.unsqueeze(-1)).squeeze(-1)
+                origins_w2 = (R_s2w @ orig_s2.unsqueeze(-1)).squeeze(-1) + t_s2w
 
-    def apply_to_camera(self, camera: Union[Cameras, Lidars]) -> torch.Tensor:
-        """Apply the pose correction to the world-to-camera matrix in a Camera object"""
-        sensor_to_world = camera.camera_to_worlds if isinstance(camera, Cameras) else camera.lidar_to_worlds
-        if self.config.mode == "off":
-            return sensor_to_world
+                raybundle.origins = origins_w2
+                raybundle.directions = dirs_w2
 
-        if camera.metadata is None or "cam_idx" not in camera.metadata:
-            # Viser cameras
-            return sensor_to_world
 
-        camera_idx = camera.metadata["cam_idx"]
-        adj = self(torch.tensor([camera_idx], dtype=torch.long, device=camera.device))  # type: ignore
-
-        return torch.cat(
-            [
-                # Apply rotation to directions in world coordinates, without touching the origin.
-                # Equivalent to: directions -> correction[:3,:3] @ directions
-                torch.bmm(adj[..., :3, :3], sensor_to_world[..., :3, :3]),
-                # Apply translation in world coordinate, independently of rotation.
-                # Equivalent to: origins -> origins + correction[:3,3]
-                sensor_to_world[..., :3, 3:] + adj[..., :3, 3:],
-            ],
-            dim=-1,
-        )
-
-    def get_loss_dict(self, loss_dict: dict) -> None:
+    def apply_to_camera(self, camera: Cameras) -> None:
+        """Apply the pose correction to the raybundle"""
+        if self.config.mode != "off":
+            assert camera.metadata is not None, "Must provide id of camera in its metadata"
+            assert "cam_idx" in camera.metadata, "Must provide id of camera in its metadata"
+            camera_idx = camera.metadata["cam_idx"]
+            adj = self(torch.tensor([camera_idx], dtype=torch.long, device=camera.device))  # type: ignore
+            adj = torch.cat([adj, torch.Tensor([0, 0, 0, 1])[None, None].to(adj)], dim=1)
+            camera.camera_to_worlds = torch.bmm(camera.camera_to_worlds, adj)
+    
+    
+    def get_loss_dict_by_sensor_type(self, loss_dict: dict, is_ext: bool) -> None:
         """Add regularization"""
         if self.config.mode != "off":
-            pose_adjustment = self._get_pose_adjustment()
+            pose_adjustment = self._get_ext_adjustment() if is_ext else self._get_lidar_adjustment()
+            # loss_dict["camera_opt_regularizer"] = (
+            #     pose_adjustment[:, :3].abs().sum(dim=-1).mean() * self.config.trans_l2_penalty
+            #     + pose_adjustment[:, 3:].abs().sum(dim=-1).mean() * self.config.rot_l2_penalty
+            # )
             loss_dict["camera_opt_regularizer"] = (
                 pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
                 + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
             )
+    
+    def get_loss_dict(self, loss_dict: dict) -> None:
+        # """Add regularization"""
+        # if self.config.mode != "off":
+        #     pose_adjustment = self._get_pose_adjustment()
+        #     loss_dict["camera_opt_regularizer"] = (
+        #         pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
+        #         + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
+        #     )
+
+        self.get_loss_dict_by_sensor_type(loss_dict, is_ext=True)
 
     def get_correction_matrices(self):
         """Get optimized pose correction matrices"""
@@ -222,12 +299,13 @@ class CameraOptimizer(nn.Module):
     def get_metrics_dict(self, metrics_dict: dict) -> None:
         """Get camera optimizer metrics"""
         if self.config.mode != "off":
-            trans = self.pose_adjustment[:, :3].detach().norm(dim=-1)
-            rot = self.pose_adjustment[:, 3:].detach().norm(dim=-1)
-            metrics_dict["camera_opt_translation_max"] = trans.max()
-            metrics_dict["camera_opt_translation_mean"] = trans.mean()
-            metrics_dict["camera_opt_rotation_mean"] = numpy.rad2deg(rot.mean().cpu())
-            metrics_dict["camera_opt_rotation_max"] = numpy.rad2deg(rot.max().cpu())
+            # pose_adjustment = self._get_pose_adjustment()
+            # metrics_dict["camera_opt_translation"] = pose_adjustment[:, :3].norm()
+            # metrics_dict["camera_opt_rotation"] = pose_adjustment[:, 3:].norm()
+            ext_adjustment = self._get_ext_adjustment()
+            lidar_adjustment = self._get_lidar_adjustment()
+            metrics_dict["camera_opt_translation"] = (self.camera_count * ext_adjustment[:, :3].norm() + lidar_adjustment[:, :3].norm()) / (self.camera_count + 1)
+            metrics_dict["camera_opt_rotation"] = (self.camera_count * ext_adjustment[:, 3:].norm() + lidar_adjustment[:, :3].norm()) / (self.camera_count + 1)
 
     def get_param_groups(self, param_groups: dict) -> None:
         """Get camera optimizer parameters"""

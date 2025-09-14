@@ -929,13 +929,8 @@ class Cameras(TensorDataclass):
             metadata["directions_norm"] = directions_norm[0].detach()
         else:
             metadata = {"directions_norm": directions_norm[0].detach()}
-
-        if (
-            self.metadata
-            and "rolling_shutter_time" in self.metadata
-            and "time_to_center_pixel" in self.metadata
-            and "velocities" in self.metadata
-        ):
+        metadata["s2w"] = c2w
+        if self.metadata and "rolling_shutter_offsets" in self.metadata and "velocities" in self.metadata:
             cam_idx = camera_indices.squeeze(-1)
             duration = self.metadata["rolling_shutter_time"][cam_idx]
             if "rs_direction" in metadata and (
@@ -957,7 +952,16 @@ class Cameras(TensorDataclass):
             del metadata["time_to_center_pixel"]  # it has served its purpose
             if "rs_direction" in metadata:
                 del metadata["rs_direction"]  # it has served its purpose
-
+        
+        # my modification
+        masked_c2w = self.camera_to_worlds[camera_indices].squeeze(1)
+        
+        if camera_indices.shape[1] == 1:
+            metadata["s2w"] = masked_c2w.reshape(masked_c2w.shape[0], 12)
+        else:
+            # print(f"camera_indices: {torch.unique(camera_indices)}")
+            # print(f"camera_indices: {camera_indices.shape}")
+            metadata["s2w"] = masked_c2w.reshape(masked_c2w.shape[0], masked_c2w.shape[1], 12)
         return RayBundle(
             origins=origins,
             directions=directions,

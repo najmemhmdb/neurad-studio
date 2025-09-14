@@ -449,6 +449,9 @@ class Lidars(TensorDataclass):
         times = self.times[lidar_indices, 0] if self.times is not None else None
         times = times + points[..., 4:5]
 
+        # my modification
+        masked_l2w = self.lidar_to_worlds[lidar_indices].squeeze(1)
+        metadata["s2w"] = masked_l2w.reshape(masked_l2w.shape[0], 12)
         return RayBundle(
             origins=origins,
             directions=directions,
