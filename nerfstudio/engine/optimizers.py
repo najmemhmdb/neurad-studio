@@ -177,7 +177,12 @@ class Optimizers:
             if max_norm is not None:
                 grad_scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.parameters[param_group], max_norm)
+            # if param_group == "camera_opt":
+            #     optimizer.param_groups[0]["params"][0].grad = 0
+                # torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]["params"][1], max_norm=1.0)
+                # torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]["params"][0], max_norm=1.0)
             if any(any(p.grad is not None for p in g["params"]) for g in optimizer.param_groups):
+                torch.autograd.set_detect_anomaly(True)
                 grad_scaler.step(optimizer)
 
     def optimizer_step_all(self) -> None:
@@ -218,3 +223,57 @@ class Optimizers:
         """
         for k, v in loaded_state.items():
             self.schedulers[k].load_state_dict(v)
+
+
+
+class IntertwinedOptimizers(Optimizers):
+    def __init__(self, config: Dict[str, Any], param_groups: Dict[str, List[Parameter]]) -> None:
+        super().__init__(config, param_groups)
+        self.step_counter = 0
+
+    def optimizer_scaler_step_some(self, grad_scaler: GradScaler, param_groups: List[str]) -> None:
+        """Take an optimizer step using a grad scaler ONLY on the specified param groups.
+
+        Args:
+            grad_scaler: GradScaler to use
+        """
+        # self.step_counter += 1
+        # if (self.step_counter // 100) % 2 == 0:
+        #     update_model = True
+        # else:
+        #     update_model = False
+
+            
+        # for param_group in param_groups:
+        #     if param_group == "camera_opt":
+        #         if update_model:
+        #             optimizer = self.optimizers[param_group]
+        #             optimizer.zero_grad()
+        #             continue
+        #     if param_group in ["hashgrids", "fields", "cnn"]:
+        #         if not update_model:
+        #             optimizer = self.optimizers[param_group]
+        #             optimizer.zero_grad()
+        #             continue
+                
+        #     optimizer = self.optimizers[param_group]
+        #     max_norm = self.config[param_group]["optimizer"].max_norm
+        #     if max_norm is not None:
+        #         grad_scaler.unscale_(optimizer)
+        #         torch.nn.utils.clip_grad_norm_(self.parameters[param_group], max_norm)
+        #     if any(any(p.grad is not None for p in g["params"]) for g in optimizer.param_groups):
+        #         grad_scaler.step(optimizer)
+
+
+        for param_group in param_groups:
+            if param_group == "camera_opt":
+                optimizer = self.optimizers[param_group]
+                optimizer.update_round_robin()
+            else:   
+                optimizer = self.optimizers[param_group]
+            max_norm = self.config[param_group]["optimizer"].max_norm
+            if max_norm is not None:
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.parameters[param_group], max_norm)
+            if any(any(p.grad is not None for p in g["params"]) for g in optimizer.param_groups):
+                grad_scaler.step(optimizer)
