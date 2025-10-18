@@ -451,7 +451,10 @@ class Lidars(TensorDataclass):
 
         # my modification
         masked_l2w = self.lidar_to_worlds[lidar_indices].squeeze(1)
-        metadata["s2w"] = masked_l2w.reshape(masked_l2w.shape[0], 12)
+        metadata["s2w"] = masked_l2w.reshape(masked_l2w.shape[0], 12).squeeze(1)
+        # metadata["coords"] = torch.zeros_like(points[..., :2], device=distance.device)
+        # metadata["fxfycxcy"] = torch.zeros((num_rays_shape[0], 4), device=distance.device)
+
         return RayBundle(
             origins=origins,
             directions=directions,
