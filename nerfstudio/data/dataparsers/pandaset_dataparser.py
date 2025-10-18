@@ -46,8 +46,7 @@ LIDAR_NAME_TO_INDEX = {
     "PandarGT": 1,
 }
 
-PANDASET_SEQ_LEN = 80 # 80
-PANDASET_SEQ_LEN = 50
+PANDASET_SEQ_LEN = 80
 EXTRINSICS_FILE_PATH = os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml")
 MAX_RELECTANCE_VALUE = 255.0
 BACK_CAMERA_BOTTOM_CROP = 260
@@ -156,7 +155,20 @@ class PandaSet(ADDataParser):
 
     def _get_lane_shift_sign(self, sequence: str) -> Literal[-1, 1]:
         return LANE_SHIFT_SIGN.get(sequence, 1)
+    
 
+    def _add_noise(self, cam2w: np.ndarray, extrinsic_l2cam: np.ndarray) -> np.ndarray:
+        """Add noise to the poses."""
+        l2w = cam2w @ extrinsic_l2cam
+        extrinsic_l2cam[0, 3] -= 0.2
+        new_cam2w = l2w @ np.linalg.inv(extrinsic_l2cam)
+        return new_cam2w
+    
+    def _reinitialize_pose(self, cam2w: np.ndarray, lidar2cam_position: np.ndarray) -> np.ndarray:
+        """Reinitialize the pose."""
+        cam2w[:3, 3] = lidar2cam_position
+        return cam2w
+    
     def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
         """Returns camera info and image filenames."""
         if "all" in self.config.cameras:
@@ -169,13 +181,26 @@ class PandaSet(ADDataParser):
         poses = []
         idxs = []
         heights = []
+            
+        front_cam_extrinsics = self.extrinsics["front_camera"]
+        front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
+        front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
+        l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)  
+
         for i in range(PANDASET_SEQ_LEN):
+            front_cam = self.sequence.camera["front_camera"]
+            front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
+            l2w = torch.from_numpy(front_cam2w @ l2front_cam)
+            
             for camera in cameras:
                 curr_cam = self.sequence.camera[camera]
                 file_path = curr_cam._data_structure[i]
                 pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
+                # pose = self._add_noise(pose, l2front_right_cam) if camera == "front_right_camera" else pose
+                pose = self._reinitialize_pose(pose, l2w[:3, 3])
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
+                
                 intrinsic = np.array(
                     [
                         [intrinsic_.fx, 0, intrinsic_.cx],
@@ -188,9 +213,8 @@ class PandaSet(ADDataParser):
                 poses.append(pose)
                 times.append(curr_cam.timestamps[i])
                 idxs.append(cameras.index(camera))
-                heights.append(1080 - (BACK_CAMERA_BOTTOM_CROP if camera == "back_camera" else 0))
-                # heights.append(1080 - (250 if camera == "front_camera" else 0))
-                heights.append(1080)
+                heights.append(1080 - (250 if camera == "back_camera" else 0))
+                # heights.append(1080)
 
         intrinsics = torch.tensor(np.array(intrinsics), dtype=torch.float32)
         poses = torch.tensor(np.array(poses), dtype=torch.float32)
@@ -219,33 +243,24 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             # the pose information in self.sequence.lidar.poses is not correct, so we compute it from the camera pose and extrinsics
             # the lidar scans are synced such that the middle of a scan is at the same time as the front camera image
-            #################################### commented because our l2w was correct ####################################
             front_cam = self.sequence.camera["front_camera"]
             front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
             front_cam_extrinsics = self.extrinsics["front_camera"]
             front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
             front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
             l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
-            l2w = torch.from_numpy(front_cam2w @ l2front_cam)
-            time = front_cam.timestamps[i]
-            # l2w = torch.from_numpy(_pandaset_pose_to_matrix(self.sequence.lidar.poses[i]))
-            # time = self.sequence.lidar.timestamps[i]
 
-            # front_cam = self.sequence.camera["front_camera"]
-            # front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
-            # front_cam_extrinsics = self.extrinsics["front_camera"]
-            # front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
-            # front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
-            # l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
-            # l2w = torch.from_numpy(front_cam2w @ l2front_cam)
-            l2w = torch.from_numpy(_pandaset_pose_to_matrix(self.sequence.lidar.poses[i]))
+
+            
+            l2w = torch.from_numpy(front_cam2w @ l2front_cam)
+            # l2w = torch.from_numpy(_pandaset_pose_to_matrix(self.sequence.lidar.poses[i]))
             
 
             # Load point cloud
             filename = self.sequence.lidar._data_structure[i]
             # since we are using the front camera pose, we need to use the front camera timestamp
-            # time = front_cam.timestamps[i]
-            time = self.sequence.lidar.timestamps[i]
+            time = front_cam.timestamps[i]
+            # time = self.sequence.lidar.timestamps[i]
 
             for lidar in self.config.lidars:
                 lidar_idx = LIDAR_NAME_TO_INDEX[lidar]
@@ -285,18 +300,17 @@ class PandaSet(ADDataParser):
 
             # Load point cloud
             point_cloud = torch.from_numpy(read_point_cloud(filename))
-            # point_cloud[:, 3] /= MAX_RELECTANCE_VALUE
-            # point_cloud[:, 3] /= MAX_RELECTANCE_VALUE
+            point_cloud[:, 3] /= MAX_RELECTANCE_VALUE
             if lidar_idx == LIDAR_NAME_TO_INDEX["Pandar64"]:
                 point_clouds_in_world.append(point_cloud[point_cloud[:, -1] == LIDAR_NAME_TO_INDEX["Pandar64"], :-1])
             points = point_cloud[:, :3]
             # transform points from world space to sensor space
             points = torch.hstack((points, torch.ones((points.shape[0], 1))))
-            # points = (torch.matmul(torch.linalg.inv(l2w), points.T).T)[:, :3]
+            points = (torch.matmul(torch.linalg.inv(l2w), points.T).T)[:, :3]
             point_cloud[:, :3] = points[:, :3]
 
             # and adjust the point cloud timestamps accordingly
-            # point_cloud[:, 4] -= lidar.times
+            point_cloud[:, 4] -= lidar.times
 
             pc = point_cloud[point_cloud[:, -1] == lidar_idx, :-1]
             point_clouds.append(pc.float())
@@ -304,63 +318,33 @@ class PandaSet(ADDataParser):
             lidars
         ), f"Number of point clouds ({len(point_clouds)}) does not match number of lidars ({len(lidars)})"
 
-        # if self.config.add_missing_points:
-        #     poses = lidars.lidar_to_worlds
-        #     times = lidars.times.squeeze(-1)
-        #     pc_without_ego_motion_comp = [
-        #         self._remove_ego_motion_compensation(pc, poses, times) for pc in point_clouds_in_world
-        #     ]
-        #     ############################### commented due to an error #########################
-        #     pc_without_ego_motion_comp = [
-        #         (self._add_channel_info(pc, k, dim=3, lidar_name="Pandar64"), pose)
-        #         for k, (pc, pose) in enumerate(pc_without_ego_motion_comp)
-        #     ]  # TODO: clean up to handle multiple lidars
-        #     ############################### commented because our points are local #########################
-        #     # project back to joint lidar pose
-        #     pc_without_ego_motion_comp = [
-        #         (pc, torch.matmul(pose_utils.inverse(l2w.unsqueeze(0)).float(), pose_utils.to4x4(pc_poses).float()))
-        #         for (pc, pc_poses), l2w in zip(pc_without_ego_motion_comp, poses)
-        #     ]
-        #     missing_points = [
-        #         self._get_missing_points(pc, poses, "Pandar64") for pc, poses in pc_without_ego_motion_comp
-        #     ]
-        #     # # drop channel info again
-        #      ############################### commented due to an error in add_info_channel #########################
-        #     missing_points = [torch.cat([pc[:, :3], pc[:, 4:]], dim=-1) for pc in missing_points]
-        #     # subtracts lidar time
-        #     # print('before for')
-        #     # print(times.shape)
-        #     for pc, time in zip(missing_points, times):
-        #         pc[:, 4] -= time
-        #     # add missing points to point clouds
-        #     point_clouds = [torch.cat([pc, missing], dim=0) for pc, missing in zip(point_clouds, missing_points)]
-        # if self.config.add_missing_points:
-        #     poses = lidars.lidar_to_worlds
-        #     times = lidars.times.squeeze(-1)
+        if self.config.add_missing_points:
+            poses = lidars.lidar_to_worlds
+            times = lidars.times.squeeze(-1)
 
-        #     pc_without_ego_motion_comp = [
-        #         self._remove_ego_motion_compensation(pc, poses, times) for pc in point_clouds_in_world
-        #     ]
-        #     pc_without_ego_motion_comp = [
-        #         (self._add_channel_info(pc, dim=3, lidar_name="Pandar64"), pose)
-        #         for pc, pose in pc_without_ego_motion_comp
-        #     ]  # TODO: clean up to handle multiple lidars
+            pc_without_ego_motion_comp = [
+                self._remove_ego_motion_compensation(pc, poses, times) for pc in point_clouds_in_world
+            ]
+            pc_without_ego_motion_comp = [
+                (self._add_channel_info(pc, dim=3, lidar_name="Pandar64"), pose)
+                for pc, pose in pc_without_ego_motion_comp
+            ]  # TODO: clean up to handle multiple lidars
 
-        #     # project back to joint lidar pose
-        #     pc_without_ego_motion_comp = [
-        #         (pc, torch.matmul(pose_utils.inverse(l2w.unsqueeze(0)).float(), pose_utils.to4x4(pc_poses).float()))
-        #         for (pc, pc_poses), l2w in zip(pc_without_ego_motion_comp, poses)
-        #     ]
-        #     missing_points = [
-        #         self._get_missing_points(pc, poses, "Pandar64") for pc, poses in pc_without_ego_motion_comp
-        #     ]
-        #     # drop channel info again
-        #     missing_points = [torch.cat([pc[:, :3], pc[:, 4:]], dim=-1) for pc in missing_points]
-        #     # subtracts lidar time
-        #     for pc, time in zip(missing_points, times):
-        #         pc[:, 4] -= time
-        #     # add missing points to point clouds
-        #     point_clouds = [torch.cat([pc, missing], dim=0) for pc, missing in zip(point_clouds, missing_points)]
+            # project back to joint lidar pose
+            pc_without_ego_motion_comp = [
+                (pc, torch.matmul(pose_utils.inverse(l2w.unsqueeze(0)).float(), pose_utils.to4x4(pc_poses).float()))
+                for (pc, pc_poses), l2w in zip(pc_without_ego_motion_comp, poses)
+            ]
+            missing_points = [
+                self._get_missing_points(pc, poses, "Pandar64") for pc, poses in pc_without_ego_motion_comp
+            ]
+            # drop channel info again
+            missing_points = [torch.cat([pc[:, :3], pc[:, 4:]], dim=-1) for pc in missing_points]
+            # subtracts lidar time
+            for pc, time in zip(missing_points, times):
+                pc[:, 4] -= time
+            # add missing points to point clouds
+            point_clouds = [torch.cat([pc, missing], dim=0) for pc, missing in zip(point_clouds, missing_points)]
 
         lidars.lidar_to_worlds = lidars.lidar_to_worlds.float()
 
