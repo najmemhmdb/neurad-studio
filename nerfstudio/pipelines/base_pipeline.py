@@ -290,7 +290,8 @@ class VanillaPipeline(Pipeline):
         self.datamanager.to(device)
         # TODO(ethan): get rid of scene_bounds from the model
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
-
+        # self.datamanager.train_dataset.metadata['lidars'].lidar_to_worlds
+        # self.datamanager.train_dataset.metadata['lidars'].times
         self._model = config.model.setup(
             scene_box=self.datamanager.train_dataset.scene_box,
             num_train_data=self.datamanager.get_num_train_data(),
@@ -298,7 +299,11 @@ class VanillaPipeline(Pipeline):
             device=device,
             grad_scaler=grad_scaler,
             seed_points=seed_pts,
+            lidar_times=self.datamanager.train_dataset.metadata['lidars'].times,
+            lidar2w=self.datamanager.train_dataset.metadata['lidars'].lidar_to_worlds,
         )
+        print(self.datamanager.train_dataset.metadata['lidars'].times)
+        # exit()
         self.model.to(device)
 
         self.world_size = world_size
