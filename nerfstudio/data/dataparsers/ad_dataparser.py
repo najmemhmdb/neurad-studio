@@ -82,7 +82,7 @@ class ADDataParserConfig(DataParserConfig):
     radars: Tuple[str, ...] = tuple()
     """Which radars to use."""
 
-    load_cuboids: bool = False #True
+    load_cuboids: bool = True #True
     """Whether to load cuboid annotations."""
     include_deformable_actors: bool = False
     """Whether to include deformable actors in the loaded trajectories (like pedestrians)."""
@@ -206,6 +206,7 @@ class ADDataParser(DataParser):
         cam_idxs = self._get_train_eval_indices(cameras)[split]
         cameras, img_filenames = cameras[cam_idxs], [img_filenames[i] for i in cam_idxs]
         lidar_idxs = self._get_train_eval_indices(lidars)[split]
+
         lidars, point_clouds = lidars[lidar_idxs], [point_clouds[i] for i in lidar_idxs]
 
         # sensor_times = torch.cat([cameras.times, lidars.times], dim=0).squeeze(-1).unique()
