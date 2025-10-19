@@ -214,8 +214,9 @@ class Trainer:
             local_rank=self.local_rank,
             grad_scaler=self.grad_scaler,
         )
-        self._load_checkpoint()  # load checkpoint before setting up optimizers in case parameters are re-registered
         self.optimizers = self.setup_optimizers()
+        self._load_checkpoint()  # load checkpoint before setting up optimizers in case parameters are re-registered
+        
 
         # set up viewer if enabled
         viewer_log_path = self.base_dir / self.config.viewer.relative_log_filename
