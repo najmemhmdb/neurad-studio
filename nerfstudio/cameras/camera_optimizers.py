@@ -18,7 +18,7 @@ Pose and Intrinsics Optimizers
 """
 
 from __future__ import annotations
-
+import open3d as o3d
 import functools
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple, Type, Union
@@ -30,16 +30,31 @@ import tyro
 from jaxtyping import Float, Int
 from torch import Tensor, nn
 from typing_extensions import assert_never
-
+from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.cameras.lidars import Lidars
-from nerfstudio.cameras.lie_groups import exp_map_SE3, exp_map_SO3xR3
+from nerfstudio.cameras.lie_groups import *
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.configs.base_config import InstantiateConfig
 from nerfstudio.engine.optimizers import OptimizerConfig
 from nerfstudio.engine.schedulers import SchedulerConfig
 from nerfstudio.utils import poses as pose_utils
+from nerfstudio.data.dataparsers.pandaset_dataparser import _pandaset_pose_to_matrix
+from nerfstudio.data.dataparsers.ad_dataparser import OPENCV_TO_NERFSTUDIO
 import os
+import json
+import yaml
+import numpy as np
+
+
+
+import os
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # headless save
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import open3d as o3d
+import matplotlib.pyplot as plt 
 
 @dataclass
 class CameraOptimizerConfig(InstantiateConfig):
@@ -50,10 +65,10 @@ class CameraOptimizerConfig(InstantiateConfig):
     mode: Literal["off", "SO3xR3", "SE3"] = "off"
     """Pose optimization strategy to use. If enabled, we recommend SO3xR3."""
 
-    trans_l2_penalty: Union[Tuple, float] = 0 #1e-2
+    trans_l2_penalty: Union[Tuple, float] = 1e-2
     """L2 penalty on translation parameters."""
 
-    rot_l2_penalty: float = 0 #1e-3
+    rot_l2_penalty: float = 1e-3
     """L2 penalty on rotation parameters."""
 
     # tyro.conf.Suppress prevents us from creating CLI arguments for these fields.
@@ -124,31 +139,19 @@ class CameraOptimizer(nn.Module):
         self.num_cameras = num_cameras
         self.device = device
         self.non_trainable_camera_indices = non_trainable_camera_indices
-
+        os.makedirs(f"calib_results/save/", exist_ok=True)
         # Initialize learnable parameters.
         if self.config.mode == "off":
             pass
         elif self.config.mode in ("SO3xR3", "SE3"):
-            # self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
-            self.camera_count = 6
-            self.sequence_length = num_cameras // (self.camera_count + 1)
-            
-            self.ext_adjustment = torch.nn.Parameter(torch.zeros((self.camera_count, 6), device=device))
-            self.lidar_adjustment = torch.nn.Parameter(torch.zeros((self.sequence_length, 6), device=device))
-            self.lidar_adjustment.requires_grad_(False)
-            
+            self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
             self.step_counter = 0
-            os.makedirs(f"calib_results/save/", exist_ok=True)
         else:
             assert_never(self.config.mode)
 
-    def _get_ext_adjustment(self) -> Float[Tensor, "num_cameras*sequence_length 6"]:
+    def _get_pose_adjustment(self) -> Float[Tensor, "num_cameras 6"]:
         """Get the pose adjustment."""
-        return self.ext_adjustment
-    
-    def _get_lidar_adjustment(self) -> Float[Tensor, "sequence_length 6"]:
-        """Get the pose adjustment."""
-        return self.lidar_adjustment
+        return self.pose_adjustment
 
     def forward(
         self,
@@ -167,50 +170,18 @@ class CameraOptimizer(nn.Module):
         if self.config.mode == "off":
             pass
         elif self.config.mode == "SO3xR3":
-
+            
             self.step_counter += 1
-            ext_adjustments = self._get_ext_adjustment()
-            lidar_adjustments = self._get_lidar_adjustment()
-
-            # create mask for lidar and camera indices
-            mask_ext = indices < (self.sequence_length * self.camera_count)
-            mask_lidar = ~mask_ext
-
-            # allocate output
-            num_indices = len(indices)
-            output = torch.zeros((num_indices, 3, 4), device="cuda")
-
-            # --- Process the lidar indices
-            if mask_lidar.any():
-                # For these indices, we subtract camera count * sequence length
-                lidar_idx = indices[mask_lidar] - (self.sequence_length * self.camera_count)
-                # Gather the corresponding adjustments (assumes lidar_adjustments is indexable with a tensor)
-                lidar_inputs = lidar_adjustments[lidar_idx]
-                # Compute the mapping in batch
-                mapped_lidar = exp_map_SO3xR3(lidar_inputs)  # Expected shape: (B, 3, 4)
-                output[mask_lidar] = mapped_lidar
-
-
-            # --- Process camera indices in batch ---
-            if mask_ext.any():
-                # Compute indices for each adjustment type
-                ext_indices = indices[mask_ext] % self.camera_count
-                # Gather adjustments for each branch
-                ext_inputs = ext_adjustments[ext_indices]
-                ext_adj = exp_map_SO3xR3(ext_inputs)       # Expected shape: (B, 3, 4)
-                output[mask_ext] = ext_adj
-                    
-            outputs.append(output)
-
             if self.step_counter % 2000 == 0 or self.step_counter == 1:
                 
                 # Convert tensor to a JSON-compatible format
-                pose_adjustment_list = exp_map_SO3xR3(self.ext_adjustment).detach().cpu().tolist()
+                pose_adjustment_list = exp_map_SO3xR3(self.pose_adjustment).detach().cpu().tolist()
                 # Save to a JSON file
                 path = f"calib_results/save"
                 with open(f"{path}/pose_adjustment{self.step_counter}.json", "w") as f:
                     json.dump(pose_adjustment_list, f)
-
+                    
+            outputs.append(exp_map_SO3xR3(self._get_pose_adjustment()[indices, :]))
         elif self.config.mode == "SE3":
             outputs.append(exp_map_SE3(self._get_pose_adjustment()[indices, :]))
         else:
@@ -225,36 +196,18 @@ class CameraOptimizer(nn.Module):
         if len(outputs) == 0:
             # Note that using repeat() instead of tile() here would result in unnecessary copies.
             return torch.eye(4, device=self.device)[None, :3, :4].tile(indices.shape[0], 1, 1)
-        return functools.reduce(pose_utils.multiply, outputs) # convert list of
-
+        return functools.reduce(pose_utils.multiply, outputs)
 
     def apply_to_raybundle(self, raybundle: RayBundle) -> None:
         """Apply the pose correction to the raybundle"""
         if self.config.mode != "off":
-            with torch.cuda.amp.autocast(enabled=False):
-                s2w = raybundle.metadata["s2w"]
-                sensor2w = s2w.reshape(s2w.shape[0], 3, 4)
-                sensor2w_4x4 = pose_utils.to4x4(sensor2w)
-                correction_matrices = self(raybundle.camera_indices.squeeze())  # type: ignore
-                correction_matrices_4x4 = pose_utils.to4x4(correction_matrices)
-                R_s2w = sensor2w_4x4[:, :3, :3]
-                t_s2w = sensor2w_4x4[:, :3,  3]
-                R_corr = correction_matrices_4x4[:, :3, :3]
-                t_corr = correction_matrices_4x4[:, :3,  3]
-                dirs_w = raybundle.directions
-                origins_w = raybundle.origins
-                # world -> sensor
-                dirs_s = (R_s2w.transpose(1, 2) @ dirs_w.unsqueeze(-1)).squeeze(-1)
-                orig_s = (R_s2w.transpose(1, 2) @ (origins_w - t_s2w).unsqueeze(-1)).squeeze(-1)
-                # apply corr in sensor
-                dirs_s2 = (R_corr @ dirs_s.unsqueeze(-1)).squeeze(-1)
-                orig_s2 = (R_corr @ orig_s.unsqueeze(-1)).squeeze(-1) + t_corr
-                # back to world
-                dirs_w2 = (R_s2w @ dirs_s2.unsqueeze(-1)).squeeze(-1)
-                origins_w2 = (R_s2w @ orig_s2.unsqueeze(-1)).squeeze(-1) + t_s2w
-
-                raybundle.origins = origins_w2
-                raybundle.directions = dirs_w2
+            correction_matrices = self(raybundle.camera_indices.squeeze())  # type: ignore
+            raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
+            raybundle.directions = (
+                torch.bmm(correction_matrices[:, :3, :3], raybundle.directions[..., None])
+                .squeeze()
+                .to(raybundle.origins)
+            )
 
 
     def apply_to_camera(self, camera: Cameras) -> None:
@@ -266,31 +219,15 @@ class CameraOptimizer(nn.Module):
             adj = self(torch.tensor([camera_idx], dtype=torch.long, device=camera.device))  # type: ignore
             adj = torch.cat([adj, torch.Tensor([0, 0, 0, 1])[None, None].to(adj)], dim=1)
             camera.camera_to_worlds = torch.bmm(camera.camera_to_worlds, adj)
-    
-    
-    def get_loss_dict_by_sensor_type(self, loss_dict: dict, is_ext: bool) -> None:
+
+    def get_loss_dict(self, loss_dict: dict) -> None:
         """Add regularization"""
         if self.config.mode != "off":
-            pose_adjustment = self._get_ext_adjustment() if is_ext else self._get_lidar_adjustment()
-            # loss_dict["camera_opt_regularizer"] = (
-            #     pose_adjustment[:, :3].abs().sum(dim=-1).mean() * self.config.trans_l2_penalty
-            #     + pose_adjustment[:, 3:].abs().sum(dim=-1).mean() * self.config.rot_l2_penalty
-            # )
+            pose_adjustment = self._get_pose_adjustment()
             loss_dict["camera_opt_regularizer"] = (
                 pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
                 + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
             )
-    
-    def get_loss_dict(self, loss_dict: dict) -> None:
-        # """Add regularization"""
-        # if self.config.mode != "off":
-        #     pose_adjustment = self._get_pose_adjustment()
-        #     loss_dict["camera_opt_regularizer"] = (
-        #         pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
-        #         + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
-        #     )
-
-        self.get_loss_dict_by_sensor_type(loss_dict, is_ext=True)
 
     def get_correction_matrices(self):
         """Get optimized pose correction matrices"""
@@ -299,13 +236,9 @@ class CameraOptimizer(nn.Module):
     def get_metrics_dict(self, metrics_dict: dict) -> None:
         """Get camera optimizer metrics"""
         if self.config.mode != "off":
-            # pose_adjustment = self._get_pose_adjustment()
-            # metrics_dict["camera_opt_translation"] = pose_adjustment[:, :3].norm()
-            # metrics_dict["camera_opt_rotation"] = pose_adjustment[:, 3:].norm()
-            ext_adjustment = self._get_ext_adjustment()
-            lidar_adjustment = self._get_lidar_adjustment()
-            metrics_dict["camera_opt_translation"] = (self.camera_count * ext_adjustment[:, :3].norm() + lidar_adjustment[:, :3].norm()) / (self.camera_count + 1)
-            metrics_dict["camera_opt_rotation"] = (self.camera_count * ext_adjustment[:, 3:].norm() + lidar_adjustment[:, :3].norm()) / (self.camera_count + 1)
+            pose_adjustment = self._get_pose_adjustment()
+            metrics_dict["camera_opt_translation"] = pose_adjustment[:, :3].norm()
+            metrics_dict["camera_opt_rotation"] = pose_adjustment[:, 3:].norm()
 
     def get_param_groups(self, param_groups: dict) -> None:
         """Get camera optimizer parameters"""
@@ -317,99 +250,333 @@ class CameraOptimizer(nn.Module):
             assert len(camera_opt_params) == 0
 
 
-class CameraVelocityOptimizer(nn.Module):
-    """Layer that modifies camera velocities during training."""
+@dataclass
+class CameraLidarTemporalOptimizerConfig(InstantiateConfig):
+    """Configuration of optimization for camera poses."""
 
-    config: CameraVelocityOptimizerConfig
+    _target: Type = field(default_factory=lambda: CameraLidarTemporalOptimizer)
 
-    def __init__(
-        self,
-        config: CameraVelocityOptimizerConfig,
+    mode: Literal["off", "SO3xR3", "SE3"] = "off"
+    """Pose optimization strategy to use. If enabled, we recommend SO3xR3."""
+
+    trans_l2_penalty: Union[Tuple, float] = 1e-2
+    """L2 penalty on translation parameters."""
+
+    rot_l2_penalty: float = 1e-3
+    """L2 penalty on rotation parameters."""
+
+    # tyro.conf.Suppress prevents us from creating CLI arguments for these fields.
+    optimizer: tyro.conf.Suppress[Optional[OptimizerConfig]] = field(default=None)
+    """Deprecated, now specified inside the optimizers dict"""
+
+    scheduler: tyro.conf.Suppress[Optional[SchedulerConfig]] = field(default=None)
+    """Deprecated, now specified inside the optimizers dict"""
+    
+    lidar_times: Optional[Tensor] = None
+    """Lidar times"""
+    lidar2w: Optional[Tensor] = None
+    """Lidar to world transform"""
+
+    def __post_init__(self):
+        if self.optimizer is not None:
+            import warnings
+
+            from nerfstudio.utils.rich_utils import CONSOLE
+
+            CONSOLE.print(
+                "\noptimizer is no longer specified in the CameraOptimizerConfig, it is now defined with the rest of the param groups inside the config file under the name 'camera_opt'\n",
+                style="bold yellow",
+            )
+            warnings.warn("above message coming from", FutureWarning, stacklevel=3)
+
+        if self.scheduler is not None:
+            import warnings
+
+            from nerfstudio.utils.rich_utils import CONSOLE
+
+            CONSOLE.print(
+                "\nscheduler is no longer specified in the CameraOptimizerConfig, it is now defined with the rest of the param groups inside the config file under the name 'camera_opt'\n",
+                style="bold yellow",
+            )
+            warnings.warn("above message coming from", FutureWarning, stacklevel=3)
+
+
+    
+
+class CameraLidarTemporalOptimizer(CameraOptimizer):
+    """Camera optimizer that optimizes the camera poses and lidar poses temporally."""
+
+    def __init__(self,
+        config: CameraLidarTemporalOptimizerConfig,
         num_cameras: int,
-        num_unique_cameras: int,
         device: Union[torch.device, str],
         non_trainable_camera_indices: Optional[Int[Tensor, "num_non_trainable_cameras"]] = None,
         **kwargs,
     ) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.num_cameras = num_cameras
-        self.num_unique_cameras = num_unique_cameras
         self.device = device
         self.non_trainable_camera_indices = non_trainable_camera_indices
+        self.step_counter = 0
+        self.camera_count = 6
+        self.sequence_length = num_cameras // (self.camera_count + 1)
+        self.ext_init, ext_noisy = self.load_init_extrinsics()
+        self.extrinsics = torch.nn.Parameter(ext_noisy)
+        self.extrinsics.requires_grad_(True)
+        self.offsets = torch.nn.Parameter(torch.tensor([[0.0],[-0.010797],[0.010783],[-0.050045],[-0.031357],[0.03129]]).to(device))
+        self.offsets.requires_grad_(False)
+        self.lidar2w = kwargs["lidar2w"].cuda()
+        self.camera_to_worlds = torch.zeros((self.camera_count*self.sequence_length, 12), device=self.device)
+        self.lidar_times = kwargs["lidar_times"].cuda()
+        os.makedirs(f"calib_results/save/times", exist_ok=True)
+        os.makedirs(f"calib_results/save/adjustments", exist_ok=True)
+        self.errors = { 0: {'x': [], 'y': [], 'z': []}, 
+                        1: {'x': [], 'y': [], 'z': []}, 
+                        2: {'x': [], 'y': [], 'z': []}, 
+                        3: {'x': [], 'y': [], 'z': []}, 
+                        4: {'x': [], 'y': [], 'z': []}, 
+                        5: {'x': [], 'y': [], 'z': []}}
+        # self.adjustment = torch.zeros((self.camera_count, 3, 4), device=device)
+        eye = torch.eye(3)[None, :3, :4].tile(self.extrinsics.shape[0], 1, 1)
+        constant = torch.zeros_like(eye[..., :, :1])
+        self.mask_adj_rot = torch.cat([eye, constant], dim=-1)
+        self.adjustment = torch.cat([eye, constant], dim=-1)
+    
 
-        # Initialize learnable parameters.
-        if self.config.enabled:
-            self.linear_velocity_adjustment = torch.nn.Parameter(
-                ((torch.rand((num_cameras, 3), device=device) - 0.5) * 1e-1)
-            )
-            self.angular_velocity_adjustment = torch.nn.Parameter(
-                ((torch.rand((num_cameras, 3), device=device) - 0.5) * 1e-4)
-            )
-            self.time_to_center_pixel_adjustment = torch.nn.Parameter(
-                ((torch.rand((num_unique_cameras), device=device) - 0.5) * 1e-6)
-            )
+    def load_init_extrinsics(self):
+        l2s_dict = yaml.load(open(os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml"), "r"), Loader=yaml.FullLoader)
+        sensors = ["front_camera", "front_left_camera", "front_right_camera", "back_camera","left_camera","right_camera"]
+        lidar2sensor_list_gt = []
+        lidar2sensor_list_noisy = []
+        
+        def _skew(w):
+            wx, wy, wz = w
+            z = torch.zeros((), dtype=w.dtype, device=w.device)
+            return torch.tensor([[0., -wz,  wy],
+                                [wz,  0., -wx],
+                                [-wy, wx,  0.]], dtype=w.dtype, device=w.device)
 
-    def get_time_to_center_pixel_adjustment(self, camera: Union[Cameras, Lidars]) -> Float[Tensor, "num_cameras 1"]:
-        """Get the time to center pixel adjustment."""
-        sensor_idx = camera.metadata["sensor_idxs"].view(-1)
-        if self.config.enabled:
-            return self.time_to_center_pixel_adjustment[sensor_idx]
-        return torch.zeros_like(sensor_idx, device=camera.device)
+        def so3_exp(phi):
+            # Rodrigues to mirror your exp_map_SO3xR3 rotation block
+            theta = torch.linalg.norm(phi)
+            I = torch.eye(3, dtype=phi.dtype, device=phi.device)
+            if theta < 1e-8:
+                K = _skew(phi)
+                return I + K + 0.5 * (K @ K)  # 2nd-order for stability
+            K = _skew(phi)
+            s, c = torch.sin(theta), torch.cos(theta)
+            a = s / theta
+            b = (1 - c) / (theta * theta)
+            return I + a * K + b * (K @ K)
 
-    def apply_to_camera_velocity(self, camera: Union[Cameras, Lidars], return_init_only) -> torch.Tensor:
-        init_velocities = None
-        sensor_to_world = camera.camera_to_worlds if isinstance(camera, Cameras) else camera.lidar_to_worlds
-        if self.config.zero_initial_velocities:
-            init_velocities = torch.zeros((len(camera), 6), device=sensor_to_world.device)
+        def rotmat_to_rotvec_match_exp(R):
+            """
+            Log that matches the Rodrigues used in exp_map_SO3xR3.
+            Picks the sign so that so3_exp(phi) ≈ R (not R^T).
+            """
+            # Standard log (your implementation is fine)
+            trace = torch.clamp(torch.trace(R), -1.0, 3.0)
+            cos_theta = (trace - 1.0) * 0.5
+            cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+            theta = torch.acos(cos_theta)
+
+            if theta < 1e-6:
+                rx = 0.5 * (R[2,1] - R[1,2])
+                ry = 0.5 * (R[0,2] - R[2,0])
+                rz = 0.5 * (R[1,0] - R[0,1])
+                phi = torch.stack([rx, ry, rz])
+            else:
+                s = torch.sin(theta)
+                kx = (R[2,1] - R[1,2]) / (2.0 * s)
+                ky = (R[0,2] - R[2,0]) / (2.0 * s)
+                kz = (R[1,0] - R[0,1]) / (2.0 * s)
+                axis = torch.stack([kx, ky, kz])
+                axis = axis / (axis.norm() + 1e-12)
+                phi = axis * theta
+
+            # Pick the sign that best reconstructs R with our Rodrigues
+            err_pos = (so3_exp(phi)   - R).abs().max()
+            err_neg = (so3_exp(-phi)  - R).abs().max()
+            return phi if err_pos <= err_neg else -phi
+
+        def mat4_to_SO3xR3_twist(T4x4: torch.Tensor) -> torch.Tensor:
+            """
+            Convert a 4x4 transform to the 6D vector for exp_map_SO3xR3.
+            Returns xi = [t_x, t_y, t_z, phi_x, phi_y, phi_z] (shape [6]).
+            """
+            T4x4 = T4x4.to(dtype=torch.float64)
+            R = T4x4[:3, :3]
+            t = T4x4[:3, 3]
+            # If R may be slightly non-orthonormal, project once:
+            # U, _, Vh = torch.linalg.svd(R); R = U @ Vh;  if torch.det(R) < 0: U[:, -1] *= -1; R = U @ Vh
+            phi = rotmat_to_rotvec_match_exp(R)
+            return torch.cat([t, phi])
+                    
+        for sensor in sensors:
+            l2s = l2s_dict[sensor]
+            l2sensor = {}
+            l2sensor["position"] = l2s["extrinsic"]["transform"]["translation"]
+            l2sensor["heading"] = l2s["extrinsic"]["transform"]["rotation"]
+            l2sensor_4x4 = _pandaset_pose_to_matrix(l2sensor)
+            lidar2sensor = torch.from_numpy(l2sensor_4x4[:3, :])
+            xi = mat4_to_SO3xR3_twist(lidar2sensor)
+            lidar2sensor_list_gt.append(xi)
+
+            l2sensor_4x4_noisy = l2sensor_4x4.copy()
+            l2sensor_4x4_noisy[:3, 3]  = [0, 0, 0]
+            lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
+            xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
+            lidar2sensor_list_noisy.append(xi_noisy)
+           
+        return torch.stack(lidar2sensor_list_gt).to(dtype=torch.float32), torch.stack(lidar2sensor_list_noisy).to(dtype=torch.float32)
+
+    
+    def forward(self, all_indices: Int[Tensor, "camera_indices"]) -> Float[Tensor, "camera_indices 3 4"]:
+        if self.step_counter < 12000:
+            self.config.trans_l2_penalty = 1
+            self.config.rot_l2_penalty = 1
         else:
-            assert camera.metadata["linear_velocities_local"] is not None
-            init_velocities = torch.hstack(
-                [camera.metadata["linear_velocities_local"], camera.metadata["angular_velocities_local"]]
-            )
+            self.config.trans_l2_penalty = 1e-1
+            self.config.rot_l2_penalty = 1e-3   
+        if self.config.mode == "SO3xR3":
+            outputs = []
+            mask_ext = all_indices < (self.sequence_length * self.camera_count)
+            ext_indices = all_indices[mask_ext]
+            lidar_indices = all_indices[~mask_ext]
+            self.step_counter += 1
 
-        if not self.config.enabled or return_init_only:  # or not self.training:
-            return init_velocities
+            ext_adjustments = self._get_ext_adjustment()
+            time_offsets = self._get_offsets()
 
-        if camera.metadata is None or "cam_idx" not in camera.metadata:
-            return init_velocities
+            camera_indices = ext_indices // self.sequence_length
+            extrinsics = ext_adjustments[camera_indices]
+            camera_offsets = time_offsets[camera_indices] 
+            seq_indices = ext_indices % self.sequence_length  #[batch size]
+            query_times = self.lidar_times[seq_indices] + camera_offsets
+            
+            extrinsics_mapped = pose_utils.to4x4(exp_map_SO3xR3(extrinsics))
+            
+            interpolated_batch_lidar2w = pose_utils.vectorized_interpolate(
+                                            self.lidar2w, self.lidar_times, query_times
+                                        )
 
-        cam_idx = camera.metadata["cam_idx"]
-        adj = torch.cat([self.linear_velocity_adjustment[cam_idx, :], self.angular_velocity_adjustment[cam_idx, :]])[
-            None
-        ]
-        return init_velocities + adj
+
+            # interpolated_batch_lidar2w = self.lidar2w[seq_indices]
+            lidar2w_4x4 = pose_utils.to4x4(interpolated_batch_lidar2w)
+
+            sensor2w = lidar2w_4x4 @ torch.inverse(extrinsics_mapped)
+            R = sensor2w[:, :3, :3]
+            sensor2w[:, :3, :3] = R @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).cuda().to(dtype=torch.float32)
+
+            # calculate adjustment
+            s2w_cameras = self.camera_to_worlds[ext_indices.cpu()].to(sensor2w.device)
+            sensor2w_init = s2w_cameras.reshape(s2w_cameras.shape[0], 3, 4)
+            init_4x4 = pose_utils.to4x4(sensor2w_init)
+            adjustment = sensor2w @ torch.inverse(init_4x4) 
+            outputs.append(adjustment[:, :3, :4])
+            # outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(ext_indices.shape[0], 1, 1))
+            if lidar_indices.any():
+                outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(lidar_indices.shape[0], 1, 1))
+
+            # visualization and debug information
+            with torch.no_grad():
+                camera_indices_unique = torch.unique(camera_indices.clone().detach())
+                for idx in camera_indices_unique:
+                    idx_mask = (ext_indices.clone().detach() // self.sequence_length) == idx
+                    self.errors[idx.item()]['x'].append([self.step_counter, self.extrinsics[idx.item()][0].item() - self.ext_init[idx.item()][0].item()])
+                    self.errors[idx.item()]['y'].append([self.step_counter, self.extrinsics[idx.item()][1].item() - self.ext_init[idx.item()][1].item()])
+                    self.errors[idx.item()]['z'].append([self.step_counter, self.extrinsics[idx.item()][2].item() - self.ext_init[idx.item()][2].item()])
+                    self.adjustment[idx.item()] = adjustment[idx_mask][0][:3, :4]
+                    
+            # === periodically render & save ===
+            if self.step_counter % 1000 == 0 or self.step_counter == 1:
+                fig, axes = plt.subplots(nrows=6, ncols=3, figsize=(15, 20))
+                axes = axes.reshape(6, 3)  # ensure it's a 2D array even if 6x3
+
+                colors = ['red', 'green', 'blue']
+                axes_labels = ['x', 'y', 'z']
+                for row, keyword in enumerate(self.errors.keys()):
+                    for col, axis in enumerate(axes_labels):
+                        if len(self.errors[keyword][axis]) > 0:
+                            data = np.array(self.errors[keyword][axis])
+                            ax = axes[row, col]
+                            ax.scatter(data[:, 0], data[:, 1], color=colors[col], s=8)
+                            ax.set_title(f"{keyword} - {axis}", fontsize=10)
+                            ax.set_xlabel("Step")
+                            ax.set_ylabel("Error Value")
+                        else:
+                            axes[row, col].axis('off')  # hide if no data
+
+                plt.tight_layout()
+                plt.savefig(f"calib_results/save/adjustments/adjustments_{self.step_counter}_new.png", dpi=200)
+                plt.close(fig)
+                for k in self.errors.keys():
+                    self.errors[k] = {'x': [], 'y': [], 'z': []}
+
+            return torch.cat(outputs, dim=0)
+        else:
+            raise ValueError(f"Not implemented for {self.config.mode}")
+            
+
+    def apply_to_raybundle(self, raybundle: RayBundle) -> None:
+        """Apply the pose correction to the raybundle"""
+        if self.config.mode != "off":
+            with torch.cuda.amp.autocast(enabled=False):
+                sensor_indices = raybundle.camera_indices.squeeze()
+                mask_ext = sensor_indices < (self.sequence_length * self.camera_count)
+                camera_to_worlds = raybundle.metadata["s2w"][mask_ext]
+                unique_indices = torch.unique(sensor_indices[mask_ext])
+                for idx in unique_indices:
+                    pose = camera_to_worlds[sensor_indices[mask_ext] == idx][0]  
+                    self.camera_to_worlds[idx.item()] = pose
+                
+                correction_matrices = self(raybundle.camera_indices.squeeze())
+                raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
+                raybundle.directions = (
+                    torch.bmm(correction_matrices[:, :3, :3], raybundle.directions[..., None])
+                    .squeeze()
+                    .to(raybundle.origins)
+                )
+
+    def _get_ext_adjustment(self) -> Float[Tensor, "num_cameras 6"]:
+        """Get the pose adjustment."""
+        return self.extrinsics
+    
+    def _get_adjustment(self) -> Float[Tensor, "num_cameras 6"]:
+        """Get the pose adjustment."""
+        return self.adjustment - self.mask_adj_rot
+    
+    def _get_offsets(self) -> Float[Tensor, "num_cameras 1"]:
+        """Get the offsets."""
+        return self.offsets
 
     def get_loss_dict(self, loss_dict: dict) -> None:
         """Add regularization"""
-        if self.config.enabled:
-            loss_dict["camera_velocity_regularizer"] = (
-                self.linear_velocity_adjustment.norm(dim=-1).mean() * self.config.linear_l2_penalty
-                + self.angular_velocity_adjustment.norm(dim=-1).mean() * self.config.angular_l2_penalty
+        if self.config.mode != "off":
+            pose_adjustment = self._get_adjustment()
+            loss_dict["camera_opt_regularizer"] = (
+                pose_adjustment[:, :3, 3].norm(dim=-1).mean() * self.config.trans_l2_penalty
+                + pose_adjustment[:, :3, :3].norm(dim=-1).mean() * self.config.rot_l2_penalty
             )
 
     def get_metrics_dict(self, metrics_dict: dict) -> None:
-        """Get camera velocity optimizer metrics"""
-        if self.config.enabled:
-            lin = self.linear_velocity_adjustment.detach().norm(dim=-1)
-            ang = self.angular_velocity_adjustment.detach().norm(dim=-1)
-            metrics_dict["camera_opt_vel_max"] = lin.max()
-            metrics_dict["camera_opt_vel_mean"] = lin.mean()
-            metrics_dict["camera_opt_ang_vel_max"] = ang.max()
-            metrics_dict["camera_opt_ang_vel_mean"] = ang.mean()
-            for i in range(self.num_unique_cameras):
-                metrics_dict[f"camera_opt_ttc_pixel_adjustment_{i}"] = self.time_to_center_pixel_adjustment[i].detach()
+        """Get camera optimizer metrics"""
+        if self.config.mode != "off":
+            pose_adjustment = self._get_adjustment()
+            metrics_dict["camera_opt_translation"] = pose_adjustment[:, :3, 3].norm(dim=-1).mean()
+            metrics_dict["camera_opt_rotation"] = pose_adjustment[:, :3, :3].norm(dim=-1).mean()
+            # metrics_dict["camera_opt_offset"] = self.offsets.norm()
 
     def get_param_groups(self, param_groups: dict) -> None:
         """Get camera optimizer parameters"""
-        vel_opt_params = list(self.parameters())
-        if self.config.enabled:
-            assert len(vel_opt_params) > 0
-            param_groups["camera_velocity_opt_linear"] = vel_opt_params[0:1]
-            param_groups["camera_velocity_opt_angular"] = vel_opt_params[1:2]
-            param_groups["camera_velocity_opt_time_to_center_pixel"] = vel_opt_params[2:3]
+        camera_opt_params = list(self.parameters())
+        print(camera_opt_params)
+        if self.config.mode != "off":
+            assert len(camera_opt_params) > 0
+            param_groups["camera_opt"] = camera_opt_params
         else:
-            assert len(vel_opt_params) == 0
+            assert len(camera_opt_params) == 0
 
 
 @dataclass
