@@ -157,10 +157,9 @@ class PandaSet(ADDataParser):
         return LANE_SHIFT_SIGN.get(sequence, 1)
     
 
-    def _add_noise(self, cam2w: np.ndarray, extrinsic_l2cam: np.ndarray) -> np.ndarray:
+    def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray) -> np.ndarray:
         """Add noise to the poses."""
-        l2w = cam2w @ extrinsic_l2cam
-        extrinsic_l2cam[0, 3] -= 0.2
+        extrinsic_l2cam[:3, 3] = [0, 0, 0]
         new_cam2w = l2w @ np.linalg.inv(extrinsic_l2cam)
         return new_cam2w
     
@@ -190,14 +189,20 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             front_cam = self.sequence.camera["front_camera"]
             front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
-            l2w = torch.from_numpy(front_cam2w @ l2front_cam)
+            l2w = front_cam2w @ l2front_cam
             
             for camera in cameras:
+
+                extrinsic_l2cam = self.extrinsics[camera]
+                extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
+                extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
+                l2cam = _pandaset_pose_to_matrix(extrinsic_l2cam) 
+
                 curr_cam = self.sequence.camera[camera]
                 file_path = curr_cam._data_structure[i]
-                pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
-                # pose = self._add_noise(pose, l2front_right_cam) if camera == "front_right_camera" else pose
-                pose = self._reinitialize_pose(pose, l2w[:3, 3])
+                # pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
+                pose = self._add_noise(l2w, l2cam)
+                # pose = self._reinitialize_pose(pose, l2w[:3, 3])
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
                 
