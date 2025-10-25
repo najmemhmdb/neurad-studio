@@ -323,7 +323,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         self.sequence_length = num_cameras // (self.camera_count + 1)
         self.ext_init, ext_noisy = self.load_init_extrinsics()
         self.extrinsics = torch.nn.Parameter(ext_noisy)
-        self.extrinsics.requires_grad_(True)
+        self.extrinsics.requires_grad_(False)
         self.offsets = torch.nn.Parameter(torch.tensor([[0.0],[-0.010797],[0.010783],[-0.050045],[-0.031357],[0.03129]]).to(device))
         self.offsets.requires_grad_(False)
         self.lidar2w = kwargs["lidar2w"].cuda()
@@ -342,7 +342,22 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         constant = torch.zeros_like(eye[..., :, :1])
         self.mask_adj_rot = torch.cat([eye, constant], dim=-1)
         self.adjustment = torch.cat([eye, constant], dim=-1)
-    
+        self.active_idx = 0
+
+
+    def target_row_this_step(self) -> int:
+        self.active_idx = (self.step_counter // 50) % self.camera_count
+        
+
+    @torch.no_grad()
+    def mask_extrinsics_grad_to_row(self):
+        self.target_row_this_step()
+        if self.extrinsics.grad is None:
+            return
+        mask = torch.zeros_like(self.extrinsics.grad)  # shape (6, 6)
+        mask[self.active_idx].fill_(1.0)
+        self.extrinsics.grad.mul_(mask)
+
 
     def load_init_extrinsics(self):
         l2s_dict = yaml.load(open(os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml"), "r"), Loader=yaml.FullLoader)
@@ -424,7 +439,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             lidar2sensor_list_gt.append(xi)
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            l2sensor_4x4_noisy[:3, 3]  = [0, 0, 0]
+            # l2sensor_4x4_noisy[:3, 3]  -= 0.15
             lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
             xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
             lidar2sensor_list_noisy.append(xi_noisy)
@@ -433,12 +448,12 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
     
     def forward(self, all_indices: Int[Tensor, "camera_indices"]) -> Float[Tensor, "camera_indices 3 4"]:
-        if self.step_counter < 12000:
-            self.config.trans_l2_penalty = 1
-            self.config.rot_l2_penalty = 1
-        else:
-            self.config.trans_l2_penalty = 1e-1
-            self.config.rot_l2_penalty = 1e-3   
+        # if self.step_counter < 12000:
+        #     self.config.trans_l2_penalty = 1
+        #     self.config.rot_l2_penalty = 1
+        # else:
+        #     self.config.trans_l2_penalty = 1e-1
+        #     self.config.rot_l2_penalty = 1e-3   
         if self.config.mode == "SO3xR3":
             outputs = []
             mask_ext = all_indices < (self.sequence_length * self.camera_count)
@@ -555,6 +570,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         """Add regularization"""
         if self.config.mode != "off":
             pose_adjustment = self._get_adjustment()
+            # Add a regularization term for camera optimizer that penalizes translation and rotation adjustments.
             loss_dict["camera_opt_regularizer"] = (
                 pose_adjustment[:, :3, 3].norm(dim=-1).mean() * self.config.trans_l2_penalty
                 + pose_adjustment[:, :3, :3].norm(dim=-1).mean() * self.config.rot_l2_penalty
