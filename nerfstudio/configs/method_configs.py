@@ -25,7 +25,7 @@ from typing import Dict, Union
 
 import tyro
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, ScaledCameraOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import CameraLidarTemporalOptimizerConfig, ScaledCameraOptimizerConfig, CameraOptimizerConfig
 from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
 from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
 from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
@@ -267,7 +267,7 @@ method_configs["splatfacto"] = TrainerConfig(
 
 method_configs["splatfacto-big"] = TrainerConfig(
     method_name="splatfacto",
-    steps_per_eval_image=100,
+    steps_per_eval_image=500,
     steps_per_eval_batch=0,
     steps_per_save=2000,
     steps_per_eval_all_images=1000,
@@ -404,7 +404,7 @@ method_configs["neurad"] = TrainerConfig(
         datamanager=ADDataManagerConfig(dataparser=PandaSetDataParserConfig(add_missing_points=True)),
         model=NeuRADModelConfig(
             eval_num_rays_per_chunk=1 << 15,
-            camera_optimizer=CameraOptimizerConfig(mode="off"),  # SO3xR3
+            camera_optimizer=CameraLidarTemporalOptimizerConfig(mode="off"),  # SO3xR3
         ),
     ),
     optimizers={
@@ -424,13 +424,15 @@ method_configs["neurad"] = TrainerConfig(
             "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
         },
+        
         "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-5, max_steps=20001, warmup_steps=2500),
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15), # 1e-4
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=8e-5, max_steps=20001, warmup_steps=5000),
         },
+
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
+    vis= "viewer+tensorboard",
     logging=LoggingConfig(steps_per_log=100),
 )
 
