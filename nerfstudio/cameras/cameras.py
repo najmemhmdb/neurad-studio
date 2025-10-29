@@ -929,7 +929,13 @@ class Cameras(TensorDataclass):
             metadata["directions_norm"] = directions_norm[0].detach()
         else:
             metadata = {"directions_norm": directions_norm[0].detach()}
-        if self.metadata and "rolling_shutter_offsets" in self.metadata and "velocities" in self.metadata:
+
+        if (
+            self.metadata
+            and "rolling_shutter_time" in self.metadata
+            and "time_to_center_pixel" in self.metadata
+            and "velocities" in self.metadata
+        ):
             cam_idx = camera_indices.squeeze(-1)
             duration = self.metadata["rolling_shutter_time"][cam_idx]
             if "rs_direction" in metadata and (

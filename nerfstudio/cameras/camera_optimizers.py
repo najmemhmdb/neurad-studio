@@ -120,6 +120,100 @@ class CameraVelocityOptimizerConfig(InstantiateConfig):
     angular_l2_penalty: float = 1e-5
     """L2 penalty on angular velocity"""
 
+class CameraVelocityOptimizer(nn.Module):
+    """Layer that modifies camera velocities during training."""
+
+    config: CameraVelocityOptimizerConfig
+
+    def __init__(
+        self,
+        config: CameraVelocityOptimizerConfig,
+        num_cameras: int,
+        num_unique_cameras: int,
+        device: Union[torch.device, str],
+        non_trainable_camera_indices: Optional[Int[Tensor, "num_non_trainable_cameras"]] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.num_cameras = num_cameras
+        self.num_unique_cameras = num_unique_cameras
+        self.device = device
+        self.non_trainable_camera_indices = non_trainable_camera_indices
+
+        # Initialize learnable parameters.
+        if self.config.enabled:
+            self.linear_velocity_adjustment = torch.nn.Parameter(
+                ((torch.rand((num_cameras, 3), device=device) - 0.5) * 1e-1)
+            )
+            self.angular_velocity_adjustment = torch.nn.Parameter(
+                ((torch.rand((num_cameras, 3), device=device) - 0.5) * 1e-4)
+            )
+            self.time_to_center_pixel_adjustment = torch.nn.Parameter(
+                ((torch.rand((num_unique_cameras), device=device) - 0.5) * 1e-6)
+            )
+
+    def get_time_to_center_pixel_adjustment(self, camera: Union[Cameras, Lidars]) -> Float[Tensor, "num_cameras 1"]:
+        """Get the time to center pixel adjustment."""
+        sensor_idx = camera.metadata["sensor_idxs"].view(-1)
+        if self.config.enabled:
+            return self.time_to_center_pixel_adjustment[sensor_idx]
+        return torch.zeros_like(sensor_idx, device=camera.device)
+
+    def apply_to_camera_velocity(self, camera: Union[Cameras, Lidars], return_init_only) -> torch.Tensor:
+        init_velocities = None
+        sensor_to_world = camera.camera_to_worlds if isinstance(camera, Cameras) else camera.lidar_to_worlds
+        if self.config.zero_initial_velocities:
+            init_velocities = torch.zeros((len(camera), 6), device=sensor_to_world.device)
+        else:
+            assert camera.metadata["linear_velocities_local"] is not None
+            init_velocities = torch.hstack(
+                [camera.metadata["linear_velocities_local"], camera.metadata["angular_velocities_local"]]
+            )
+
+        if not self.config.enabled or return_init_only:  # or not self.training:
+            return init_velocities
+
+        if camera.metadata is None or "cam_idx" not in camera.metadata:
+            return init_velocities
+
+        cam_idx = camera.metadata["cam_idx"]
+        adj = torch.cat([self.linear_velocity_adjustment[cam_idx, :], self.angular_velocity_adjustment[cam_idx, :]])[
+            None
+        ]
+        return init_velocities + adj
+
+    def get_loss_dict(self, loss_dict: dict) -> None:
+        """Add regularization"""
+        if self.config.enabled:
+            loss_dict["camera_velocity_regularizer"] = (
+                self.linear_velocity_adjustment.norm(dim=-1).mean() * self.config.linear_l2_penalty
+                + self.angular_velocity_adjustment.norm(dim=-1).mean() * self.config.angular_l2_penalty
+            )
+
+    def get_metrics_dict(self, metrics_dict: dict) -> None:
+        """Get camera velocity optimizer metrics"""
+        if self.config.enabled:
+            lin = self.linear_velocity_adjustment.detach().norm(dim=-1)
+            ang = self.angular_velocity_adjustment.detach().norm(dim=-1)
+            metrics_dict["camera_opt_vel_max"] = lin.max()
+            metrics_dict["camera_opt_vel_mean"] = lin.mean()
+            metrics_dict["camera_opt_ang_vel_max"] = ang.max()
+            metrics_dict["camera_opt_ang_vel_mean"] = ang.mean()
+            for i in range(self.num_unique_cameras):
+                metrics_dict[f"camera_opt_ttc_pixel_adjustment_{i}"] = self.time_to_center_pixel_adjustment[i].detach()
+
+    def get_param_groups(self, param_groups: dict) -> None:
+        """Get camera optimizer parameters"""
+        vel_opt_params = list(self.parameters())
+        if self.config.enabled:
+            assert len(vel_opt_params) > 0
+            param_groups["camera_velocity_opt_linear"] = vel_opt_params[0:1]
+            param_groups["camera_velocity_opt_angular"] = vel_opt_params[1:2]
+            param_groups["camera_velocity_opt_time_to_center_pixel"] = vel_opt_params[2:3]
+        else:
+            assert len(vel_opt_params) == 0
+
 
 class CameraOptimizer(nn.Module):
     """Layer that modifies camera poses to be optimized as well as the field during training."""
@@ -567,10 +661,10 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         if self.config.mode != "off": 
             pose_adjustment = self._get_adjustment()
             # Add a regularization term for camera optimizer that penalizes translation and rotation adjustments.
-            loss_dict["camera_opt_regularizer"] = (
-                pose_adjustment[:, :3, 3].mean().norm(dim=-1) * self.config.trans_l2_penalty
-                + pose_adjustment[:, :3, :3].mean().norm(dim=-1) * self.config.rot_l2_penalty
-            )
+            # loss_dict["camera_opt_regularizer"] = (
+            #     pose_adjustment[:, :3, 3].mean().norm(dim=-1) * self.config.trans_l2_penalty
+            #     + pose_adjustment[:, :3, :3].mean().norm(dim=-1) * self.config.rot_l2_penalty
+            # )
             
             # # Increasing regularization over time
             # if self.step_counter < 1000:

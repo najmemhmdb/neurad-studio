@@ -435,7 +435,7 @@ class PandaSet(ADDataParser):
         self.extrinsics = yaml.load(open(EXTRINSICS_FILE_PATH, "r"), Loader=yaml.FullLoader)
         return super()._generate_dataparser_outputs(split)
 
-    def _add_channel_info(self, point_cloud: torch.Tensor, k: int, dim: int = -1, lidar_name: str = "") -> torch.Tensor:
+    def _add_channel_info(self, point_cloud: torch.Tensor, dim: int = -1, lidar_name: str = "") -> torch.Tensor:
         """Infer channel id from point cloud, and add it to the point cloud.
 
         Args:
@@ -446,23 +446,21 @@ class PandaSet(ADDataParser):
             channel_id is added to dim
         """
         # these are limits where channels are equally spaced
-        print(k, lidar_name)
         ELEV_HIGH_IDX = 5
         ELEV_LOW_IDX = -11
         ELEV_LOW_IDX_ABS = len(self.config.lidar_elevation_mapping[lidar_name]) + ELEV_LOW_IDX
-        # print(ELEV_LOW_IDX_ABS)
-        # print(torch.min(point_cloud[:, 2]), torch.max(point_cloud[:, 2]))
+
         dist = torch.norm(point_cloud[:, :3], dim=-1)
-        # print('dist shape', dist.shape)
         elevation = torch.arcsin(point_cloud[:, 2] / dist)
         elevation = torch.rad2deg(elevation)
-        # print((self.config.lidar_elevation_mapping[lidar_name][ELEV_LOW_IDX_ABS] - 0.2),
-            #   (self.config.lidar_elevation_mapping[lidar_name][ELEV_HIGH_IDX] + 0.2))
+
         middle_elev_mask = (elevation < (self.config.lidar_elevation_mapping[lidar_name][ELEV_HIGH_IDX] + 0.2)) & (
             elevation > (self.config.lidar_elevation_mapping[lidar_name][ELEV_LOW_IDX_ABS] - 0.2)
         )
         middle_elev = elevation[middle_elev_mask]
+
         histc, bin_edges = torch.histogram(middle_elev, bins=2000)
+
         # channels should be equally spaced
         expected_channel_edges = (bin_edges[-1] - bin_edges[0]) / 49 * torch.arange(50) + bin_edges[0]
 
@@ -476,7 +474,6 @@ class PandaSet(ADDataParser):
         empty_bin = []
         empty_bins_edges = []
         for i in range(len(histc)):
-            
             if histc[i] == 0:
                 empty_bin.append(i)
             else:
@@ -484,6 +481,7 @@ class PandaSet(ADDataParser):
                     empty_bins.append(empty_bin)
                     empty_bins_edges.append((bin_edges[empty_bin[0]], bin_edges[empty_bin[-1] + 1]))
                     empty_bin = []
+
         # find channel edges, use first expected for init
         found_channel_edges = [expected_channel_edges[0].tolist()]
         empty_bins_edges = torch.tensor(empty_bins_edges)
@@ -552,7 +550,6 @@ class PandaSet(ADDataParser):
 
         point_cloud = torch.cat([point_cloud[:, :dim], channel_id, point_cloud[:, dim:]], dim=-1)
         return point_cloud
-
 
 def _pandaset_pose_to_matrix(pose):
     translation = np.array([pose["position"]["x"], pose["position"]["y"], pose["position"]["z"]])

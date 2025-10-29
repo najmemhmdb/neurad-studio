@@ -197,7 +197,53 @@ def interpolate_trajectories(poses, pose_times, query_times, pose_valid_mask=Non
     interpolated_poses = torch.cat([interp_rot, interp_pos.unsqueeze(-1)], dim=-1)
     return interpolated_poses, query_idxs, object_idxs
 
+def interpolate_velocities(velocities, pose_times, query_times, clamp_frac=False):
+    qt = query_times if query_times.shape[-1] == 1 else query_times.view(-1)
+    right_idx = torch.searchsorted(pose_times, qt)
+    right_idx = right_idx.clamp(min=1, max=len(pose_times) - 1)
+    left_idx = right_idx - 1
 
+    # Compute the fraction between the left (previous) and right (after) timestamps
+    right_time = pose_times[right_idx]
+    left_time = pose_times[left_idx]
+    time_diff = right_time - left_time + 1e-6
+    fraction = (qt - left_time) / time_diff  # 0 = all left, 1 = all right
+    if clamp_frac:
+        fraction = fraction.clamp(0.0, 1.0)  # clamp to handle out of bounds
+    velocity_left = velocities[left_idx]
+    velocity_right = velocities[right_idx]
+    interpolated_velocities = velocity_left + (velocity_right - velocity_left) * fraction.unsqueeze(-1)
+    return interpolated_velocities
+
+def rotation_difference(rot1, rot2):
+    """Compute the difference between two rotations, i.e., how to rotate rot1 to get to rot2.
+       Equivalent to "rot2 - rot1".
+
+    Args:
+        rot1: A rotation matrix [..., 3, 3].
+        rot2: A rotation matrix [..., 3, 3].
+
+    Returns:
+        The difference between the two rotations, expressed as axis-angle representation.
+    """
+
+    # Relative rotation matrix
+    R_rel = rot1.transpose(-2, -1) @ rot2
+    # Compute the angle of rotation
+    theta = torch.acos(((R_rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1) / 2).clamp(-1, 1))
+
+    # Compute the axis of rotation
+    axis = torch.stack(
+        [
+            R_rel[..., 2, 1] - R_rel[..., 1, 2],
+            R_rel[..., 0, 2] - R_rel[..., 2, 0],
+            R_rel[..., 1, 0] - R_rel[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    axis = F.normalize(axis, dim=-1)
+
+    return theta.unsqueeze(-1) * axis
 
 def vectorized_interpolate(poses, pose_times, query_times):
     """
