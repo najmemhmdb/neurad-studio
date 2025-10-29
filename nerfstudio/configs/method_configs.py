@@ -426,8 +426,8 @@ method_configs["neurad"] = TrainerConfig(
         },
         
         "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15), # 1e-4
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=8e-5, max_steps=20001, warmup_steps=5000),
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15), # 1e-4
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2000),
         },
 
     },
