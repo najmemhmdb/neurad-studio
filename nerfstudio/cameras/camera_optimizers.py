@@ -224,10 +224,10 @@ class CameraOptimizer(nn.Module):
         """Add regularization"""
         if self.config.mode != "off":
             pose_adjustment = self._get_pose_adjustment()
-            loss_dict["camera_opt_regularizer"] = (
-                pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
-                + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
-            )
+            # loss_dict["camera_opt_regularizer"] = (
+            #     pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
+            #     + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
+            # )
 
     def get_correction_matrices(self):
         """Get optimized pose correction matrices"""
@@ -323,7 +323,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         self.sequence_length = num_cameras // (self.camera_count + 1)
         self.ext_init, ext_noisy = self.load_init_extrinsics()
         self.extrinsics = torch.nn.Parameter(ext_noisy)
-        self.extrinsics.requires_grad_(False)
+        self.extrinsics.requires_grad_(True)
         self.offsets = torch.nn.Parameter(torch.tensor([[0.0],[-0.010797],[0.010783],[-0.050045],[-0.031357],[0.03129]]).to(device))
         self.offsets.requires_grad_(False)
         self.lidar2w = kwargs["lidar2w"].cuda()
@@ -338,25 +338,25 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                         4: {'x': [], 'y': [], 'z': []}, 
                         5: {'x': [], 'y': [], 'z': []}}
         # self.adjustment = torch.zeros((self.camera_count, 3, 4), device=device)
-        eye = torch.eye(3)[None, :3, :4].tile(self.extrinsics.shape[0], 1, 1)
+        eye = torch.eye(3)[None, :3, :4]
         constant = torch.zeros_like(eye[..., :, :1])
-        self.mask_adj_rot = torch.cat([eye, constant], dim=-1)
-        self.adjustment = torch.cat([eye, constant], dim=-1)
-        self.active_idx = 0
+        self.mask_adj_rot = torch.cat([eye, constant], dim=-1).to('cuda')
+        # self.adjustment = torch.cat([eye, constant], dim=-1).to('cuda')
+        # self.active_idx = 0
 
 
-    def target_row_this_step(self) -> int:
-        self.active_idx = (self.step_counter // 50) % self.camera_count
+    # def target_row_this_step(self) -> int:
+    #     self.active_idx = (self.step_counter // 50) % self.camera_count
         
 
-    @torch.no_grad()
-    def mask_extrinsics_grad_to_row(self):
-        self.target_row_this_step()
-        if self.extrinsics.grad is None:
-            return
-        mask = torch.zeros_like(self.extrinsics.grad)  # shape (6, 6)
-        mask[self.active_idx].fill_(1.0)
-        self.extrinsics.grad.mul_(mask)
+    # @torch.no_grad()
+    # def mask_extrinsics_grad_to_row(self):
+    #     self.target_row_this_step()
+    #     if self.extrinsics.grad is None:
+    #         return
+    #     mask = torch.zeros_like(self.extrinsics.grad)  # shape (6, 6)
+    #     mask[self.active_idx].fill_(1.0)
+    #     self.extrinsics.grad.mul_(mask)
 
 
     def load_init_extrinsics(self):
@@ -439,7 +439,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             lidar2sensor_list_gt.append(xi)
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            # l2sensor_4x4_noisy[:3, 3]  -= 0.15
+            l2sensor_4x4_noisy[:3, 3]  += 0.15
             lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
             xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
             lidar2sensor_list_noisy.append(xi_noisy)
@@ -448,12 +448,6 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
     
     def forward(self, all_indices: Int[Tensor, "camera_indices"]) -> Float[Tensor, "camera_indices 3 4"]:
-        # if self.step_counter < 12000:
-        #     self.config.trans_l2_penalty = 1
-        #     self.config.rot_l2_penalty = 1
-        # else:
-        #     self.config.trans_l2_penalty = 1e-1
-        #     self.config.rot_l2_penalty = 1e-3   
         if self.config.mode == "SO3xR3":
             outputs = []
             mask_ext = all_indices < (self.sequence_length * self.camera_count)
@@ -493,6 +487,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             # outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(ext_indices.shape[0], 1, 1))
             if lidar_indices.any():
                 outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(lidar_indices.shape[0], 1, 1))
+            self.adjustment = adjustment[:, :3, :4]
 
             # visualization and debug information
             with torch.no_grad():
@@ -502,7 +497,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                     self.errors[idx.item()]['x'].append([self.step_counter, self.extrinsics[idx.item()][0].item() - self.ext_init[idx.item()][0].item()])
                     self.errors[idx.item()]['y'].append([self.step_counter, self.extrinsics[idx.item()][1].item() - self.ext_init[idx.item()][1].item()])
                     self.errors[idx.item()]['z'].append([self.step_counter, self.extrinsics[idx.item()][2].item() - self.ext_init[idx.item()][2].item()])
-                    self.adjustment[idx.item()] = adjustment[idx_mask][0][:3, :4]
+                
                     
             # === periodically render & save ===
             if self.step_counter % 1000 == 0 or self.step_counter == 1:
@@ -543,8 +538,9 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                 camera_to_worlds = raybundle.metadata["s2w"][mask_ext]
                 unique_indices = torch.unique(sensor_indices[mask_ext])
                 for idx in unique_indices:
-                    pose = camera_to_worlds[sensor_indices[mask_ext] == idx][0]  
-                    self.camera_to_worlds[idx.item()] = pose
+                    with torch.no_grad():
+                        pose = camera_to_worlds[sensor_indices[mask_ext] == idx][0]
+                        self.camera_to_worlds[idx.item()] = pose.detach()
                 
                 correction_matrices = self(raybundle.camera_indices.squeeze())
                 raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
@@ -568,13 +564,27 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
     def get_loss_dict(self, loss_dict: dict) -> None:
         """Add regularization"""
-        if self.config.mode != "off":
+        if self.config.mode != "off": 
             pose_adjustment = self._get_adjustment()
             # Add a regularization term for camera optimizer that penalizes translation and rotation adjustments.
             loss_dict["camera_opt_regularizer"] = (
-                pose_adjustment[:, :3, 3].norm(dim=-1).mean() * self.config.trans_l2_penalty
-                + pose_adjustment[:, :3, :3].norm(dim=-1).mean() * self.config.rot_l2_penalty
+                pose_adjustment[:, :3, 3].mean().norm(dim=-1) * self.config.trans_l2_penalty
+                + pose_adjustment[:, :3, :3].mean().norm(dim=-1) * self.config.rot_l2_penalty
             )
+            
+            # # Increasing regularization over time
+            # if self.step_counter < 1000:
+            #     trans_weight = 1
+            #     rot_weight = 1
+            # else:
+            #     # Increase regularization to prevent oscillations
+            #     trans_weight = 0.03
+            #     rot_weight = 0.1
+                
+            # loss_dict["camera_opt_regularizer"] = (
+            #     pose_adjustment[:, :3, 3].mean().norm(dim=-1) * trans_weight
+            #     + pose_adjustment[:, :3, :3].mean().norm(dim=-1) * rot_weight
+            # )
 
     def get_metrics_dict(self, metrics_dict: dict) -> None:
         """Get camera optimizer metrics"""
@@ -587,7 +597,6 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
     def get_param_groups(self, param_groups: dict) -> None:
         """Get camera optimizer parameters"""
         camera_opt_params = list(self.parameters())
-        print(camera_opt_params)
         if self.config.mode != "off":
             assert len(camera_opt_params) > 0
             param_groups["camera_opt"] = camera_opt_params
