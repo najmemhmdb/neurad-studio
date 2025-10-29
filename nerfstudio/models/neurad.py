@@ -58,6 +58,12 @@ from nerfstudio.utils.external import TCNN_EXISTS
 from nerfstudio.utils.math import chamfer_distance
 from nerfstudio.utils.printing import print_tcnn_speed_warning
 from nerfstudio.viewer.server.viewer_elements import ViewerSlider
+import torch
+import kornia as K
+import kornia.filters as KF
+import kornia.color as KC
+import kornia.morphology as KM
+
 
 EPS = 1e-7
 
@@ -533,6 +539,10 @@ class NeuRADModel(ADModel):
         loss_dict = {}
         if "image" in batch:
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
+            edges = self.edge_aware_blur(rgb.permute(0, 3, 1, 2), canny_low=0.1, canny_high=0.2, blur_ksize=3, blur_sigma=1.0, dilate_ksize=3)
+            rgb_weighted = rgb * edges.permute(0, 2, 3, 1)
+            image_weighted = image * edges.permute(0, 2, 3, 1)
+            loss_dict["rgb_edge_aware_loss"] = self.rgb_loss(image_weighted, rgb_weighted) * conf.rgb_mult * 2
             loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult
             if conf.vgg_mult > 0.0:
                 loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
@@ -619,6 +629,45 @@ class NeuRADModel(ADModel):
             else:
                 metrics_dict["chamfer_distance"] = points[did_return, :3].norm(dim=-1).mean()
         return metrics_dict, images_dict
+    # @torch.no_grad()  # remove if you need grads
+    def edge_aware_blur(self,
+        x: torch.Tensor,
+        canny_low: float = 0.1,
+        canny_high: float = 0.2,
+        blur_ksize: int = 7,
+        blur_sigma: float = 2.0,
+        dilate_ksize: int = 3,   # set <=1 to skip dilation
+    ):
+        assert x.ndim == 4, "x must be [B, C, H, W]"
+        device, dtype_in = x.device, x.dtype
+
+        # normalize to [0,1] float for Kornia ops
+        img = x.clamp(0, 1) if x.dtype.is_floating_point else x.float().clamp(0, 255) / 255.0
+
+        # grayscale for edge detection
+        gray = KC.rgb_to_grayscale(img) if img.size(1) == 3 else img
+
+        # edges via Canny
+        canny = KF.Canny(low_threshold=canny_low, high_threshold=canny_high)
+        edges, _ = canny(gray)  # [B,1,H,W] in [0,1]
+
+        # optional dilation to thicken the mask
+        if dilate_ksize and dilate_ksize > 1:
+            kernel = torch.ones(dilate_ksize, dilate_ksize, device=device, dtype=img.dtype)  # <-- 2D kernel
+            edges = KM.dilation(edges, kernel)
+
+        mask = (edges > 0.5).to(img.dtype)  # [B,1,H,W]
+
+        # blur whole image, then mix only on edges
+        blurred = KF.gaussian_blur2d(img, (blur_ksize, blur_ksize), (blur_sigma, blur_sigma))
+        out = img * (1 - mask) + blurred * mask
+
+        # return in original dtype/range
+        if not dtype_in.is_floating_point:
+            out = (out * 255.0).round().clamp(0, 255).to(dtype_in)
+        else:
+            out = out.to(dtype_in)
+        return out
 
     @torch.no_grad()
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
