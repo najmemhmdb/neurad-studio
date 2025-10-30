@@ -656,17 +656,17 @@ class NeuRADModel(ADModel):
             kernel = torch.ones(dilate_ksize, dilate_ksize, device=device, dtype=img.dtype)  # <-- 2D kernel
             edges = KM.dilation(edges, kernel)
 
-        mask = (edges > 0.5).to(img.dtype)  # [B,1,H,W]
+        # mask = (edges > 0.5).to(img.dtype)  # [B,1,H,W]
 
-        # blur whole image, then mix only on edges
-        blurred = KF.gaussian_blur2d(img, (blur_ksize, blur_ksize), (blur_sigma, blur_sigma))
-        out = img * (1 - mask) + blurred * mask
+        # # blur whole image, then mix only on edges
+        # blurred = KF.gaussian_blur2d(img, (blur_ksize, blur_ksize), (blur_sigma, blur_sigma))
+        # out = img * (1 - mask) + blurred * mask
 
         # return in original dtype/range
         if not dtype_in.is_floating_point:
-            out = (out * 255.0).round().clamp(0, 255).to(dtype_in)
+            out = (edges * 255.0).round().clamp(0, 255).to(dtype_in)
         else:
-            out = out.to(dtype_in)
+            out = edges.to(dtype_in)
         return out
 
     @torch.no_grad()
