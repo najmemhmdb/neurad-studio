@@ -25,7 +25,7 @@ from typing import Dict, Union
 
 import tyro
 
-from nerfstudio.cameras.camera_optimizers import CameraLidarTemporalOptimizerConfig, ScaledCameraOptimizerConfig, CameraOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import ScaledCameraOptimizerConfig, CameraOptimizerConfig
 from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
 from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
 from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
@@ -404,7 +404,7 @@ method_configs["neurad"] = TrainerConfig(
         datamanager=ADDataManagerConfig(dataparser=PandaSetDataParserConfig(add_missing_points=True)),
         model=NeuRADModelConfig(
             eval_num_rays_per_chunk=1 << 15,
-            camera_optimizer=CameraLidarTemporalOptimizerConfig(mode="off"),  # SO3xR3
+            camera_optimizer=CameraOptimizerConfig(mode="off"),  # SO3xR3
         ),
     ),
     optimizers={
