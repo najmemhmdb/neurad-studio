@@ -46,7 +46,7 @@ class ADPipelineConfig(VanillaPipelineConfig):
     """specifies the model config"""
     calc_fid_steps: Tuple[int, ...] = (20000,)  # NOTE: must also be an eval step for this to work
     """Whether to calculate FID for lane shifted images."""
-    ray_patch_size: Tuple[int, int] = (32, 32)
+    ray_patch_size: Tuple[int, int] = (128, 128)
     """Size of the ray patches to sample from the image during training (for camera rays only)."""
 
     def __post_init__(self) -> None:
