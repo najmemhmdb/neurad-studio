@@ -535,9 +535,6 @@ class SimulatorDataParser(ADDataParser):
             times=times,
             metadata={"sensor_idxs": idxs},
         )
-
-        # new_filenames = cameras_undistortion(filenames, intrinsics[0], self.config.distortion_params)
-        # exit(0)
         return cameras, filenames
 
     
@@ -728,15 +725,3 @@ def get_mock_timestamps(points: npt.NDArray[np.float32]) -> npt.NDArray[np.float
     # get the pseudo timestamps based on the total rotation time
     timestamps = fraction_of_rotation * LIDAR_ROTATION_TIME
     return timestamps
-
-# def cameras_undistortion(filenames: List[str], camera_intrinsics: np.ndarray, distortion_params: List[float]) -> None:
-#     """Undistort the cameras."""
-#     print(camera_intrinsics)
-#     exit(0)
-#     new_filenames = []
-#     for filename in filenames:
-#         image = cv2.imread(filename)
-#         image = cv2.undistort(image, camera_intrinsics.numpy(), np.array(distortion_params))
-#         cv2.imwrite(str(filename).replace(".png", "_undistorted.png"), image)
-#         new_filenames.append(Path(str(filename).replace(".png", "_undistorted.png")))
-#     return new_filenames
