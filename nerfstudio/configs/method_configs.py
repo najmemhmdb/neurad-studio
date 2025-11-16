@@ -25,7 +25,7 @@ from typing import Dict, Union
 
 import tyro
 
-from nerfstudio.cameras.camera_optimizers import ScaledCameraOptimizerConfig, CameraLidarTemporalOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import ScaledCameraOptimizerConfig, CameraOptimizerConfig, CameraLidarTemporalOptimizerConfig
 from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
 from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
 from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
