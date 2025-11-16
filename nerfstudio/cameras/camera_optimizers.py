@@ -407,6 +407,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         non_trainable_camera_indices: Optional[Int[Tensor, "num_non_trainable_cameras"]] = None,
         **kwargs,
     ) -> None:
+        # add a code to verify branches
         nn.Module.__init__(self)
         self.config = config
         self.num_cameras = num_cameras
