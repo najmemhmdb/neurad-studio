@@ -200,8 +200,8 @@ class PandaSet(ADDataParser):
 
                 curr_cam = self.sequence.camera[camera]
                 file_path = curr_cam._data_structure[i]
-                # pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
-                pose = self._add_noise(l2w, l2cam)
+                pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
+                # pose = self._add_noise(l2w, l2cam)
                 # pose = self._reinitialize_pose(pose, l2w[:3, 3])
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
