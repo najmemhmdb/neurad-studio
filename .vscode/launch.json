@@ -41,9 +41,9 @@
         "--pipeline.datamanager.eval-num-lidar-rays-per-batch=128",
         "--pipeline.datamanager.train_num_rays_per_batch=4096",
         "--pipeline.datamanager.eval_num_rays_per_batch=4096",
-        "--pipeline.model.camera-optimizer.mode=SO3xR3",
-        "pandaset-data",
-        "--data=./data/pandaset",
+        // "--pipeline.model.camera-optimizer.mode=SO3xR3",
+        "simulator-data",
+        "--data=./data/Simulator_1Nov2025",
         "--dataset_end_fraction=1.0",
         "--cameras=all"
       ]
