@@ -159,15 +159,11 @@ class PandaSet(ADDataParser):
 
     def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray) -> np.ndarray:
         """Add noise to the poses."""
-        extrinsic_l2cam[:3, 3] += 0.15
+        random_noise = np.random.normal(0, 0.2, 1)
+        extrinsic_l2cam[:3, 3] += random_noise
         new_cam2w = l2w @ np.linalg.inv(extrinsic_l2cam)
         return new_cam2w
-    
-    def _reinitialize_pose(self, cam2w: np.ndarray, lidar2cam_position: np.ndarray) -> np.ndarray:
-        """Reinitialize the pose."""
-        cam2w[:3, 3] = lidar2cam_position
-        return cam2w
-    
+
     def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
         """Returns camera info and image filenames."""
         if "all" in self.config.cameras:
@@ -200,9 +196,8 @@ class PandaSet(ADDataParser):
 
                 curr_cam = self.sequence.camera[camera]
                 file_path = curr_cam._data_structure[i]
-                pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
-                # pose = self._add_noise(l2w, l2cam)
-                # pose = self._reinitialize_pose(pose, l2w[:3, 3])
+                # pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
+                pose = self._add_noise(l2w, l2cam)
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
                 
@@ -219,7 +214,6 @@ class PandaSet(ADDataParser):
                 times.append(curr_cam.timestamps[i])
                 idxs.append(cameras.index(camera))
                 heights.append(1080 - (250 if camera == "back_camera" else 0))
-                # heights.append(1080)
 
         intrinsics = torch.tensor(np.array(intrinsics), dtype=torch.float32)
         poses = torch.tensor(np.array(poses), dtype=torch.float32)
@@ -254,19 +248,13 @@ class PandaSet(ADDataParser):
             front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
             front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
             l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
-
-
             
             l2w = torch.from_numpy(front_cam2w @ l2front_cam)
-            # l2w = torch.from_numpy(_pandaset_pose_to_matrix(self.sequence.lidar.poses[i]))
             
-
             # Load point cloud
             filename = self.sequence.lidar._data_structure[i]
             # since we are using the front camera pose, we need to use the front camera timestamp
             time = front_cam.timestamps[i]
-            # time = self.sequence.lidar.timestamps[i]
-
             for lidar in self.config.lidars:
                 lidar_idx = LIDAR_NAME_TO_INDEX[lidar]
                 lidar_filenames.append(Path(filename))
