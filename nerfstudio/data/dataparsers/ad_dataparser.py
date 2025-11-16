@@ -82,7 +82,7 @@ class ADDataParserConfig(DataParserConfig):
     radars: Tuple[str, ...] = tuple()
     """Which radars to use."""
 
-    load_cuboids: bool = False #True
+    load_cuboids: bool = True #True
     """Whether to load cuboid annotations."""
     include_deformable_actors: bool = False
     """Whether to include deformable actors in the loaded trajectories (like pedestrians)."""
