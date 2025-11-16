@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, CameraOptimizer
+from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, CameraLidarTemporalOptimizerConfig, CameraOptimizer
 from nerfstudio.cameras.lidars import Lidars
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.model_components.dynamic_actors import DynamicActors, DynamicActorsConfig
@@ -37,8 +37,8 @@ class ADModelConfig(ModelConfig):
     dynamic_actors: DynamicActorsConfig = field(default_factory=DynamicActorsConfig)
     """Dynamic actors configuration."""
 
-    camera_optimizer: CameraOptimizerConfig = field(
-        default_factory=lambda: CameraOptimizerConfig(mode="off", trans_l2_penalty=0.1)
+    camera_optimizer: CameraLidarTemporalOptimizerConfig = field(
+        default_factory=lambda: CameraLidarTemporalOptimizerConfig(mode="off", trans_l2_penalty=0.1)
     )
     """Config of the camera optimizer to use"""
 
@@ -67,11 +67,9 @@ class ADModel(Model):
         super().populate_modules()
         trajectories = self.kwargs["metadata"].get("trajectories")
         self.dynamic_actors: DynamicActors = self.config.dynamic_actors.setup(trajectories=trajectories)
-        # self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
-        #     num_cameras=self.num_train_data, device="cpu", lidar_times=self.kwargs["lidar_times"], lidar2w=self.kwargs["lidar2w"]
-        # )
+        
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
-            num_cameras=self.num_train_data, device="cpu"
+            num_cameras=self.num_train_data, device="cpu", lidar_times=self.kwargs["lidar_times"], lidar2w=self.kwargs["lidar2w"]
         )
 
     def get_param_groups(self) -> Dict[str, List[torch.nn.Parameter]]:
