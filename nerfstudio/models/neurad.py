@@ -539,10 +539,10 @@ class NeuRADModel(ADModel):
         loss_dict = {}
         if "image" in batch:
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
-            edges = self.edge_aware_blur(rgb.permute(0, 3, 1, 2), canny_low=0.1, canny_high=0.2, blur_ksize=3, blur_sigma=1.0, dilate_ksize=3)
-            rgb_weighted = rgb * edges.permute(0, 2, 3, 1)
-            image_weighted = image * edges.permute(0, 2, 3, 1)
-            loss_dict["rgb_edge_aware_loss"] = self.rgb_loss(image_weighted, rgb_weighted) * conf.rgb_mult * 2
+            # edges = self.edge_aware_blur(rgb.permute(0, 3, 1, 2), canny_low=0.1, canny_high=0.2, blur_ksize=3, blur_sigma=1.0, dilate_ksize=3)
+            # rgb_weighted = rgb * edges.permute(0, 2, 3, 1)
+            # image_weighted = image * edges.permute(0, 2, 3, 1)
+            # loss_dict["rgb_edge_aware_loss"] = self.rgb_loss(image_weighted, rgb_weighted) * conf.rgb_mult * 2
             loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult
             if conf.vgg_mult > 0.0:
                 loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
