@@ -49,6 +49,8 @@ VERTICAL_BEAM_DIVERGENCE = 1.5e-3
 LIDAR_ROTATION_TIME = 0.1
 # Maximum reflectance value for normalization
 MAX_REFLECTANCE_VALUE = 255.0
+EGO_OBJECT_ID = "10010"
+STATIONARY_DISPLACEMENT_THRESHOLD = 0.25  # meters
 
 # Allowed classes for trajectory loading
 ALLOWED_RIGID_CLASSES = {
@@ -82,7 +84,7 @@ SIMULATOR_TO_OPENCV = np.array(
 LANE_SHIFT_SIGN: Dict[str, Literal[-1, 1]] = defaultdict(lambda: -1)
 LANE_SHIFT_SIGN.update(
     {
-        "001": -1,
+        "001": 1,
     }
 )
 
@@ -126,6 +128,8 @@ class SimulatorDataParserConfig(ADDataParserConfig):
     """The rolling shutter time for the cameras (seconds)."""
     time_to_center_pixel: float = 0.0
     """The time offset for the center pixel, relative to the image timestamp (seconds)."""
+    stationary_displacement_threshold: float = STATIONARY_DISPLACEMENT_THRESHOLD
+    """Minimum translation (m) for an actor to be considered dynamic."""
     # distortion_params: Optional[List[float]]  = field(
     #     default_factory=lambda: [
     #         0.00343299, -0.01468419,  0.24592364, -0.00815786
@@ -168,6 +172,8 @@ class SimulatorDataParser(ADDataParser):
         self.agent_id = config.agent_id
         self.label_file = self.data_dir / "labels" / "label_nerf_sample.json"
         self.sensor_params_file = self.data_dir / "labels" / "sensor_parameters.json"
+        self.ego_object_id = EGO_OBJECT_ID
+        self.stationary_displacement_threshold = config.stationary_displacement_threshold
         
         # Load sensor parameters first (needed for "all" cameras check)
         if not self.sensor_params_file.exists():
@@ -199,7 +205,7 @@ class SimulatorDataParser(ADDataParser):
         # Cache for ground truth files
         self._ego_files_cache: Dict[Tuple[str, float], Dict] = {}
         self._sensor_files_cache: Dict[Tuple[str, float], Dict] = {}
-        self._compute_ego_poses_cache()
+        # self._compute_ego_poses_cache()
         # output_path = Path("ego_poses.json")
 
     
@@ -392,7 +398,7 @@ class SimulatorDataParser(ADDataParser):
             cuboid = obj_data.get("object_data", {}).get("cuboid", {})
             
             cuboid_value = cuboid.get("value", [])
-            E_object_in_world, _ = _cuboid_to_pose_and_dims(cuboid_value)
+            E_object_in_world, _ = cuboid_to_pose_and_dims(cuboid_value)
             
             # Get object pose in ego frame
             E_object_in_ego = self._get_object_pose_from_ego_file(camera_name, timestamp, obj_id)
@@ -492,7 +498,12 @@ class SimulatorDataParser(ADDataParser):
             
             frame_data = self.frames_data[frame_id]
             for camera_id in self.config.cameras:
-                ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+
+
+                ego_pose_in_world, _ = cuboid_to_pose_and_dims(
+                    self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
+                )
                 sensor_in_ego_dict = self.sensor_params[f"{self.config.agent_id}"][f"{camera_id}"]["extrinsic"]
                 sensor_in_ego = _extrinsic_to_matrix(sensor_in_ego_dict)
                 Rotation = sensor_in_ego[:3, :3]
@@ -555,9 +566,14 @@ class SimulatorDataParser(ADDataParser):
                 continue
 
             for lidar_id in self.config.lidars:
-                ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+                ego_pose_in_world, _ = cuboid_to_pose_and_dims(
+                    self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
+                )
                 sensor_in_ego_dict = self.sensor_params[f"{self.config.agent_id}"][f"{lidar_id}"]["extrinsic"]
                 sensor_in_ego = _extrinsic_to_matrix(sensor_in_ego_dict)
+                # Lidar uses same coordinate convention as world frame (X forward, Y left, Z up)
+                # No SIMULATOR_TO_OPENCV transformation needed for lidar
                 pose = ego_pose_in_world @ sensor_in_ego
                 poses.append(torch.from_numpy(pose[:3, :4]).float())
                 times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
@@ -621,7 +637,7 @@ class SimulatorDataParser(ADDataParser):
                 cuboid = obj_data.get("object_data", {}).get("cuboid", {})
                 cuboid_value = cuboid.get("value", [])
             
-                pose, dims = _cuboid_to_pose_and_dims(cuboid_value)
+                pose, dims = cuboid_to_pose_and_dims(cuboid_value)
                 object_trajectories[obj_id].append((timestamp, pose, dims, obj_type))
         
         # Convert to trajectory format
@@ -633,7 +649,8 @@ class SimulatorDataParser(ADDataParser):
             traj_data.sort(key=lambda x: x[0])
             
             timestamps = torch.tensor([t[0] for t in traj_data], dtype=torch.float64)
-            poses = torch.tensor([t[1] for t in traj_data], dtype=torch.float32)
+            pose_list = [t[1] for t in traj_data]
+            poses = torch.tensor(pose_list, dtype=torch.float32)
             dims_list = [t[2] for t in traj_data]
             obj_type = traj_data[0][3]
             
@@ -642,6 +659,9 @@ class SimulatorDataParser(ADDataParser):
             dims = torch.tensor(dims, dtype=torch.float32)
             
             # Determine properties
+            positions = np.array([pose[:3, 3] for pose in pose_list])
+            displacement = np.linalg.norm(positions[-1] - positions[0])
+            is_stationary = displacement < self.stationary_displacement_threshold
             is_rigid = obj_type in ALLOWED_RIGID_CLASSES
             is_deformable = obj_type in ALLOWED_DEFORMABLE_CLASSES
             is_symmetric = obj_type in {
@@ -651,7 +671,6 @@ class SimulatorDataParser(ADDataParser):
                 "TYPE_COMPACT_CAR",
                 "TYPE_LUXURY_CAR",
             }
-            is_stationary = False  # Would need velocity info to determine
             
             trajectories.append(
                 {
@@ -662,6 +681,8 @@ class SimulatorDataParser(ADDataParser):
                     "stationary": is_stationary,
                     "symmetric": is_symmetric,
                     "deformable": is_deformable,
+                    "is_ego": obj_id == self.ego_object_id,
+                    "object_id": obj_id,
                 }
             )
         
@@ -669,7 +690,7 @@ class SimulatorDataParser(ADDataParser):
 
 
 
-def _cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.ndarray]:
+def cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.ndarray]:
     """Convert cuboid value to pose and dimensions.
     
     Cuboid format: [x, y, z, qx, qy, qz, qw, length, width, height]
