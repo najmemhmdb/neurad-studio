@@ -43,7 +43,7 @@ import torch
 import tyro
 import viser
 import viser.transforms as vtf
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from nerfstudio.cameras.lidars import intensity_to_rgb, transform_points
 from nerfstudio.data.dataparsers.simulator_dataparser import SimulatorDataParserConfig
@@ -51,6 +51,38 @@ from nerfstudio.data.dataparsers.pandaset_dataparser import PandaSetDataParserCo
 from nerfstudio.utils.rich_utils import CONSOLE
 
 DEFAULT_DISTORTION_PARAMS = np.array([-0.10086563, 0.06112929, -0.04727966, 0.00974163], dtype=np.float32)
+BOX_EDGES = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 0),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+]
+
+
+def _compute_box_corners_local(dims: np.ndarray) -> np.ndarray:
+    """Return the eight local-space corners for a box with [length, width, height]."""
+    half_l, half_w, half_h = dims[0] / 2, dims[1] / 2, dims[2] / 2
+    return np.array(
+        [
+            [-half_w, -half_l, -half_h],
+            [+half_w, -half_l, -half_h],
+            [+half_w, +half_l, -half_h],
+            [-half_w, +half_l, -half_h],
+            [-half_w, -half_l, +half_h],
+            [+half_w, -half_l, +half_h],
+            [+half_w, +half_l, +half_h],
+            [-half_w, +half_l, +half_h],
+        ],
+        dtype=np.float32,
+    )
 
 
 @dataclass
@@ -134,13 +166,13 @@ class DataParserVisualizer:
         
         # Load dataparser
         CONSOLE.print(f"[bold green]Loading dataparser from {config.data}")
-        dataparser_config = PandaSetDataParserConfig(
-            data=config.data,id=config.agent_id,
+        dataparser_config = SimulatorDataParserConfig(
+            data=config.data,
+            agent_id=config.agent_id,
             start_frame=config.start_frame,
             end_frame=config.end_frame,
             cameras=config.cameras,
-            lidars=config
-            agent_.lidars,
+            lidars=config.lidars,
         )
         self.dataparser = dataparser_config.setup()
         
@@ -168,12 +200,20 @@ class DataParserVisualizer:
         self._lidar_poses: Optional[torch.Tensor] = None  # Lidar poses (3x4) for interpolation
         self._projection_summary_handle = None
         self._projection_image_handle = None
+        self._actor_projection_summary_handle = None
+        self._actor_projection_image_handle = None
         self._camera_intrinsics_overrides: Dict[int, Dict[str, float]] = {}
         self._timestamp_slider = None
         self._timestamp_summary_handle = None
         self._show_snapshot_checkbox = None
         self._timestamp_snapshot_handles: Dict[int, List[viser.SceneNodeHandle]] = {}  # traj_idx -> list of edge handles
         self._timestamp_values = self._collect_available_timestamps()
+        self._actor_projection_intro_text = (
+            "[small][bold]Actor bounding box validation[/bold]\n"
+            "Select a camera to overlay tracked actors that fall inside the field of view at that timestamp."
+            "[/small]"
+        )
+        self._actor_label_font = ImageFont.load_default()
         
         # Add UI controls
         self._setup_ui()
@@ -212,13 +252,20 @@ class DataParserVisualizer:
     def _setup_projection_panel(self):
         """Setup UI for camera-lidar projection diagnostics."""
         with self.server.add_gui_folder("Camera Inspection"):
-            self._projection_intro_text = (
-                "[small][bold]Camera / LiDAR validation[/bold]\n"
-                "Click any camera frustum to reproject the cached LiDAR points into the selected image."
-                "[/small]"
-            )
-            self._projection_summary_handle = self.server.add_gui_markdown(self._projection_intro_text)
-            self._projection_image_handle = self.server.add_gui_markdown("")
+            tabs = self.server.add_gui_tab_group()
+            with tabs.add_tab("LiDAR Overlay"):
+                self._projection_intro_text = (
+                    "[small][bold]Camera / LiDAR validation[/bold]\n"
+                    "Click any camera frustum to reproject the cached LiDAR points into the selected image."
+                    "[/small]"
+                )
+                self._projection_summary_handle = self.server.add_gui_markdown(self._projection_intro_text)
+                self._projection_image_handle = self.server.add_gui_markdown("")
+            with tabs.add_tab("Actor Boxes"):
+                self._actor_projection_summary_handle = self.server.add_gui_markdown(
+                    self._actor_projection_intro_text
+                )
+                self._actor_projection_image_handle = self.server.add_gui_markdown("")
 
     def _set_projection_summary(self, content: str) -> None:
         """Update the summary markdown for projection panel."""
@@ -230,10 +277,22 @@ class DataParserVisualizer:
         if self._projection_image_handle is not None:
             self._projection_image_handle.content = markdown
 
+    def _set_actor_projection_summary(self, content: str) -> None:
+        """Update the actor bounding box summary markdown."""
+        if self._actor_projection_summary_handle is not None:
+            self._actor_projection_summary_handle.content = content
+
+    def _set_actor_projection_image(self, markdown: str) -> None:
+        """Update the actor bounding box preview markdown."""
+        if self._actor_projection_image_handle is not None:
+            self._actor_projection_image_handle.content = markdown
+
     def _reset_projection_panel(self) -> None:
         """Clear the projection widgets."""
         self._set_projection_summary(self._projection_intro_text)
         self._set_projection_image("")
+        self._set_actor_projection_summary(self._actor_projection_intro_text)
+        self._set_actor_projection_image("")
 
     def _setup_timestamp_slider(self) -> None:
         """Create UI for selecting timestamp snapshots."""
@@ -315,23 +374,8 @@ class DataParserVisualizer:
         Returns:
             List of line segment handles
         """
-        # Get half dimensions
-        # dims is [length, width, height], so dims[0]=length, dims[1]=width, dims[2]=height
-        half_l, half_w, half_h = dims[0] / 2, dims[1] / 2, dims[2] / 2
-        
-        # Define 8 corners of the box in local coordinates
         # Actor frame convention: x-right, y-forward, z-up
-        # So: x varies for width (left/right), y varies for length (back/front), z varies for height (down/up)
-        corners_local = np.array([
-            [-half_w, -half_l, -half_h],  # 0: bottom-back-left (x=left, y=back, z=bottom)
-            [+half_w, -half_l, -half_h],  # 1: bottom-back-right (x=right, y=back, z=bottom)
-            [+half_w, +half_l, -half_h],  # 2: bottom-front-right (x=right, y=front, z=bottom)
-            [-half_w, +half_l, -half_h],  # 3: bottom-front-left (x=left, y=front, z=bottom)
-            [-half_w, -half_l, +half_h],  # 4: top-back-left (x=left, y=back, z=top)
-            [+half_w, -half_l, +half_h],  # 5: top-back-right (x=right, y=back, z=top)
-            [+half_w, +half_l, +half_h],  # 6: top-front-right (x=right, y=front, z=top)
-            [-half_w, +half_l, +half_h],  # 7: top-front-left (x=left, y=front, z=top)
-        ], dtype=np.float32)
+        corners_local = _compute_box_corners_local(dims)
         
         # Transform corners to world coordinates
         from scipy.spatial.transform import Rotation as R
@@ -386,6 +430,14 @@ class DataParserVisualizer:
             handles.append(handle)
         
         return handles
+
+    def _compute_box_corners_world(self, dims: np.ndarray, pose: np.ndarray) -> np.ndarray:
+        """Compute world-space corners given dims [length, width, height] and SE3 pose."""
+        corners_local = _compute_box_corners_local(dims)
+        rotation = pose[:3, :3]
+        translation = pose[:3, 3]
+        corners_world = corners_local @ rotation.T + translation
+        return corners_world
 
     def _update_timestamp_snapshot(self, timestamp: float, index: int) -> None:
         """Update actor bounding boxes for a specific timestamp."""
@@ -703,17 +755,16 @@ class DataParserVisualizer:
         return (image_tensor.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
 
     def _encode_image_markdown(self, image_np: np.ndarray, title: str) -> str:
-        """Encode image as markdown with optional title and max dimension constraint."""
-        buffer = BytesIO()
-        Image.fromarray(image_np).save(buffer, format="PNG")
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        """Encode image as markdown data URI, resized to fit projection_preview_max_dim."""
         max_dim = self.config.projection_preview_max_dim
-        return (
-            f"<div style='max-width:{max_dim}px'>"
-            f"<div><strong>{title}</strong></div>"
-            f"<img style='width:100%' src='data:image/png;base64,{encoded}'/>"
-            f"</div>"
-        )
+        pil_image = Image.fromarray(image_np)
+        # Preserve aspect ratio while capping the max dimension
+        pil_image.thumbnail((max_dim, max_dim), Image.BILINEAR)
+        buffer = BytesIO()
+        pil_image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        safe_title = title.replace("\n", " ")
+        return f"![{safe_title}](data:image/png;base64,{encoded})"
 
     def _render_projection_preview(
         self, image_tensor: torch.Tensor, px: torch.Tensor, py: torch.Tensor, colors: np.ndarray
@@ -741,6 +792,11 @@ class DataParserVisualizer:
         except Exception as exc:
             self._set_projection_summary(f"[red]Projection failed:[/red] {exc}")
             self._set_projection_image("")
+        try:
+            self._project_actor_boxes_to_image(camera_idx)
+        except Exception as exc:
+            self._set_actor_projection_summary(f"[red]Actor overlay failed:[/red] {exc}")
+            self._set_actor_projection_image("")
 
     def _project_points_to_image(self, camera_idx: int) -> None:
         """Project nearest lidar scan points into the requested camera image."""
@@ -855,6 +911,173 @@ class DataParserVisualizer:
         self._set_projection_summary(
             f"[green]Camera {camera_idx:05d}[/green] · showing {num_points} / {total_points} points "
             f"from nearest lidar scan (Δt={time_diff:.3f}s)"
+        )
+
+    def _project_actor_boxes_to_image(self, camera_idx: int) -> None:
+        """Overlay actor bounding boxes visible to the selected camera."""
+        metadata = self.outputs.metadata or {}
+        trajectories = metadata.get("actor_trajectories") or metadata.get("trajectories")
+        if not trajectories:
+            self._set_actor_projection_summary("[yellow]⚠ No trajectory data available.")
+            self._set_actor_projection_image("")
+            return
+
+        cameras = self.outputs.cameras
+        if camera_idx >= len(cameras):
+            self._set_actor_projection_summary(f"[yellow]⚠ Invalid camera index {camera_idx}.")
+            self._set_actor_projection_image("")
+            return
+
+        if cameras.times is None:
+            self._set_actor_projection_summary("[yellow]⚠ Camera timestamps missing; cannot align actors.")
+            self._set_actor_projection_image("")
+            return
+
+        camera_time = cameras.times[camera_idx].item()
+        image_tensor = self._get_image_tensor(camera_idx)
+        if image_tensor is None:
+            self._set_actor_projection_summary(f"[yellow]⚠ Missing image for camera index {camera_idx}.")
+            self._set_actor_projection_image("")
+            return
+
+        overrides = self._camera_intrinsics_overrides.get(camera_idx)
+        if overrides:
+            fx = overrides["fx"]
+            fy = overrides["fy"]
+            cx = overrides["cx"]
+            cy = overrides["cy"]
+            width = int(overrides["width"])
+            height = int(overrides["height"])
+        else:
+            fx = float(cameras.fx[camera_idx].item())
+            fy = float(cameras.fy[camera_idx].item())
+            cx = float(cameras.cx[camera_idx].item())
+            cy = float(cameras.cy[camera_idx].item())
+            width = int(cameras.width[camera_idx].item())
+            height = int(cameras.height[camera_idx].item())
+
+        c2w = cameras.camera_to_worlds[camera_idx].cpu()
+        from nerfstudio.utils.poses import inverse
+
+        w2c = inverse(c2w.unsqueeze(0)).squeeze(0)
+        tolerance = self.config.timestamp_match_tolerance
+
+        image_np = self._image_tensor_to_uint8(image_tensor)
+        pil_image = Image.fromarray(image_np.copy())
+        draw = ImageDraw.Draw(pil_image)
+
+        matches = 0
+        considered = 0
+        max_time_delta = 0.0
+
+        for traj_idx, trajectory in enumerate(trajectories):
+            timestamps = trajectory.get("timestamps")
+            poses = trajectory.get("poses")
+            dims = trajectory.get("dims")
+            if timestamps is None or poses is None or dims is None:
+                continue
+
+            if isinstance(timestamps, torch.Tensor):
+                ts_tensor = timestamps.to(torch.float64)
+            else:
+                ts_tensor = torch.tensor(timestamps, dtype=torch.float64)
+            if ts_tensor.numel() == 0:
+                continue
+
+            diffs = torch.abs(ts_tensor - camera_time)
+            min_diff, min_idx = torch.min(diffs, dim=0)
+            time_error = float(min_diff.item())
+            if time_error > tolerance:
+                continue
+
+            considered += 1
+            max_time_delta = max(max_time_delta, time_error)
+
+            pose_index = int(min_idx.item()) if isinstance(min_idx, torch.Tensor) else int(min_idx)
+            pose_entry = poses[pose_index]
+            if isinstance(pose_entry, torch.Tensor):
+                pose_np = pose_entry.detach().cpu().numpy()
+            else:
+                pose_np = np.asarray(pose_entry, dtype=np.float32)
+
+            if isinstance(dims, torch.Tensor):
+                dims_np = dims.detach().cpu().numpy()
+            else:
+                dims_np = np.asarray(dims, dtype=np.float32)
+            dims_viser = np.array([dims_np[1], dims_np[0], dims_np[2]], dtype=np.float32)
+
+            # Compute world corners and project into camera
+            corners_world = self._compute_box_corners_world(dims_viser, pose_np)
+            corners_world_tensor = torch.from_numpy(corners_world).to(device=w2c.device, dtype=w2c.dtype)
+            cam_points = transform_points(corners_world_tensor, w2c.unsqueeze(0)).squeeze(0)
+            forward_mask = cam_points[:, 2] < 0
+            if not torch.any(forward_mask):
+                continue
+
+            cam_points = cam_points.clone()
+            cam_points[:, 1] *= -1.0
+            cam_points[:, 2] *= -1.0
+            depths = cam_points[:, 2]
+
+            pixel_coords: List[Optional[Tuple[int, int]]] = []
+            inside_fov = False
+            for corner_idx in range(cam_points.shape[0]):
+                depth = float(depths[corner_idx].item())
+                if depth <= 1e-6:
+                    pixel_coords.append(None)
+                    continue
+                u = fx * (cam_points[corner_idx, 0].item() / depth) + cx
+                v = fy * (cam_points[corner_idx, 1].item() / depth) + cy
+                if u < 0 or u >= width or v < 0 or v >= height:
+                    pixel_coords.append(None)
+                    continue
+                pixel_coords.append((int(round(u)), int(round(v))))
+                inside_fov = True
+
+            if not inside_fov:
+                continue
+
+            color = self._get_trajectory_color(trajectory.get("label", "unknown"), bool(trajectory.get("is_ego", False)))
+            for start_idx, end_idx in BOX_EDGES:
+                p0 = pixel_coords[start_idx]
+                p1 = pixel_coords[end_idx]
+                if p0 is None or p1 is None:
+                    continue
+                draw.line([p0[0], p0[1], p1[0], p1[1]], fill=color, width=2)
+
+            valid_pixels = [pt for pt in pixel_coords if pt is not None]
+            if valid_pixels:
+                min_u = min(pt[0] for pt in valid_pixels)
+                min_v = min(pt[1] for pt in valid_pixels)
+                label = trajectory.get("label") or f"actor_{traj_idx:04d}"
+                text = label if not trajectory.get("is_ego", False) else f"{label} (ego)"
+                text_bbox = draw.textbbox((0, 0), text, font=self._actor_label_font)
+                text_w = text_bbox[2] - text_bbox[0]
+                text_h = text_bbox[3] - text_bbox[1]
+                text_x = int(np.clip(min_u, 0, max(0, width - text_w - 1)))
+                text_y = int(np.clip(min_v - text_h - 2, 0, max(0, height - text_h - 1)))
+                draw.rectangle(
+                    (text_x - 2, text_y - 2, text_x + text_w + 2, text_y + text_h + 2),
+                    fill=(0, 0, 0),
+                )
+                draw.text((text_x, text_y), text, font=self._actor_label_font, fill=(255, 255, 255))
+
+            matches += 1
+
+        if matches == 0:
+            self._set_actor_projection_summary(
+                f"[yellow]⚠ No actors intersect camera {camera_idx:05d}'s FOV at t={camera_time:.3f}s (tol={tolerance:.3e}s)."
+            )
+            self._set_actor_projection_image("")
+            return
+
+        overlay_np = np.array(pil_image)
+        markdown_image = self._encode_image_markdown(overlay_np, f"Actor boxes · camera {camera_idx:05d}")
+        self._set_actor_projection_image(markdown_image)
+        self._set_actor_projection_summary(
+            "[green]Actor overlay[/green] · "
+            f"camera {camera_idx:05d} shows {matches} actor(s) (checked {considered} within tolerance, "
+            f"max Δt={max_time_delta:.3e}s, tol={tolerance:.3e}s)"
         )
     
     def visualize_cameras(self):
