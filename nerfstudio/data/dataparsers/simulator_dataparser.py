@@ -709,7 +709,7 @@ def cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.n
     pose[:3, 3] = [x, y, z]
     
     # Dimensions in wlh order (width, length, height)
-    dims = np.array([width, length, height], dtype=np.float32)
+    dims = np.array([length, width, height], dtype=np.float32)
     
     return pose, dims
 
