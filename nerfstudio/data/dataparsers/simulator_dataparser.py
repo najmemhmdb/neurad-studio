@@ -205,7 +205,7 @@ class SimulatorDataParser(ADDataParser):
         # Cache for ground truth files
         self._ego_files_cache: Dict[Tuple[str, float], Dict] = {}
         self._sensor_files_cache: Dict[Tuple[str, float], Dict] = {}
-        # self._compute_ego_poses_cache()
+        self._compute_ego_poses_cache()
         # output_path = Path("ego_poses.json")
 
     
@@ -409,35 +409,40 @@ class SimulatorDataParser(ADDataParser):
         
         if len(ego_pose_candidates) == 1:
             return ego_pose_candidates[0]
-        
+        ego_pose_candidates = np.array(ego_pose_candidates)
+        mean_pose = mean_pose_quaternion(ego_pose_candidates)
+        return mean_pose
         # Sanity check: verify all candidates are consistent
         # Compare all pairs to check if they're the same (within tolerance)
-        translation_tolerance = 0.01  # 1cm tolerance
-        rotation_tolerance = 0.001  # ~0.057 degrees tolerance
+        # translation_tolerance = 0.0001  # 1cm tolerance
+        # rotation_tolerance = 0.00001  # ~0.057 degrees tolerance
         
-        reference_pose = ego_pose_candidates[0]
-        all_consistent = True
+        # reference_pose = ego_pose_candidates[0]
+        # all_consistent = True
         
-        for candidate_pose in ego_pose_candidates[1:]:
-            # Check translation difference
-            trans_error = np.linalg.norm(reference_pose[:3, 3] - candidate_pose[:3, 3])
-            if trans_error > translation_tolerance:
-                all_consistent = False
-                break
+    #     for candidate_pose in ego_pose_candidates:
+    #         # Check translation difference
+    #         trans_error = np.linalg.norm(reference_pose[:3, 3] - candidate_pose[:3, 3])
+    #         if trans_error > translation_tolerance:
+    #             all_consistent = False
+    #             print(f"Translation difference: {trans_error}, timestamp: {timestamp}, camera_name: {camera_name}")
+    #             # break
             
-            # Check rotation difference (angle between rotations)
-            R1, R2 = reference_pose[:3, :3], candidate_pose[:3, :3]
-            R_diff = R1.T @ R2
-            trace = np.trace(R_diff)
-            angle_error = np.arccos(np.clip((trace - 1) / 2, -1, 1))
-            if angle_error > rotation_tolerance:
-                all_consistent = False
-                break
-        print(f"All consistent: {all_consistent}, timestamp: {timestamp}, camera_name: {camera_name}")
-        # If all candidates are consistent, return the reference pose
-        # Otherwise, still return it but it indicates there might be an issue
-        # (The sanity check function will catch this)
-        return reference_pose
+    #         # Check rotation difference (angle between rotations)
+    #         R1, R2 = reference_pose[:3, :3], candidate_pose[:3, :3]
+    #         R_diff = R1.T @ R2
+    #         trace = np.trace(R_diff)
+    #         angle_error = np.arccos(np.clip((trace - 1) / 2, -1, 1))
+    #         if angle_error > rotation_tolerance:
+    #             all_consistent = False
+    #             print(f"Rotation difference: {angle_error}, timestamp: {timestamp}, camera_name: {camera_name}")
+    #             # break
+    #     if not all_consistent:
+    #         print(f"All consistent: {all_consistent}, timestamp: {timestamp}, camera_name: {camera_name}")
+    #     # If all candidates are consistent, return the reference pose
+    #     # Otherwise, still return it but it indicates there might be an issue
+    #     # (The sanity check function will catch this)
+    #     return reference_pose
 
     def _compute_ego_poses_cache(self):
         """Pre-compute and cache ego poses for all timestamps."""
@@ -498,12 +503,12 @@ class SimulatorDataParser(ADDataParser):
             
             frame_data = self.frames_data[frame_id]
             for camera_id in self.config.cameras:
-                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+                ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
 
 
-                ego_pose_in_world, _ = cuboid_to_pose_and_dims(
-                    self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
-                )
+                # ego_pose_in_world, _ = cuboid_to_pose_and_dims(
+                #     self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
+                # )
                 sensor_in_ego_dict = self.sensor_params[f"{self.config.agent_id}"][f"{camera_id}"]["extrinsic"]
                 sensor_in_ego = _extrinsic_to_matrix(sensor_in_ego_dict)
                 Rotation = sensor_in_ego[:3, :3]
@@ -566,10 +571,10 @@ class SimulatorDataParser(ADDataParser):
                 continue
 
             for lidar_id in self.config.lidars:
-                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
-                ego_pose_in_world, _ = cuboid_to_pose_and_dims(
-                    self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
-                )
+                ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+                # ego_pose_in_world, _ = cuboid_to_pose_and_dims(
+                #     self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
+                # )
                 sensor_in_ego_dict = self.sensor_params[f"{self.config.agent_id}"][f"{lidar_id}"]["extrinsic"]
                 sensor_in_ego = _extrinsic_to_matrix(sensor_in_ego_dict)
                 # Lidar uses same coordinate convention as world frame (X forward, Y left, Z up)
@@ -708,7 +713,6 @@ def cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.n
     pose[:3, :3] = rot_matrix
     pose[:3, 3] = [x, y, z]
     
-    # Dimensions in wlh order (width, length, height)
     dims = np.array([length, width, height], dtype=np.float32)
     
     return pose, dims
@@ -746,3 +750,48 @@ def get_mock_timestamps(points: npt.NDArray[np.float32]) -> npt.NDArray[np.float
     # get the pseudo timestamps based on the total rotation time
     timestamps = fraction_of_rotation * LIDAR_ROTATION_TIME
     return timestamps
+
+
+
+def mean_pose_quaternion(poses, weights=None):
+    """
+    poses: array-like, shape (N,4,4)
+    weights: optional shape (N,)
+    returns: mean pose, shape (4,4)
+    """
+    poses = np.asarray(poses, dtype=float)
+    N = poses.shape[0]
+    if weights is None:
+        weights = np.ones(N) / N
+    else:
+        weights = np.asarray(weights, dtype=float)
+        weights = weights / weights.sum()
+
+    # --- mean translation
+    t_mean = np.sum(weights[:, None] * poses[:, :3, 3], axis=0)
+
+    # --- mean rotation via Markley quaternion averaging (needs scipy)
+    from scipy.spatial.transform import Rotation as R
+
+    quats = R.from_matrix(poses[:, :3, :3]).as_quat()  # (x,y,z,w)
+
+    # Fix sign ambiguity (q and -q are same rotation) for stability
+    q0 = quats[0]
+    for i in range(N):
+        if np.dot(quats[i], q0) < 0:
+            quats[i] = -quats[i]
+
+    A = np.zeros((4, 4))
+    for w, q in zip(weights, quats):
+        A += w * np.outer(q, q)
+
+    eigvals, eigvecs = np.linalg.eigh(A)
+    q_mean = eigvecs[:, np.argmax(eigvals)]
+    q_mean /= np.linalg.norm(q_mean)
+
+    R_mean = R.from_quat(q_mean).as_matrix()
+
+    T_mean = np.eye(4)
+    T_mean[:3, :3] = R_mean
+    T_mean[:3, 3] = t_mean
+    return T_mean
