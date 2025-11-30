@@ -112,7 +112,8 @@ class SimulatorDataParserConfig(ADDataParserConfig):
     """End frame"""
     agent_id: str = "agent_1"
     """ID of the agent to load."""
-    
+    is_undistorted: bool = True
+    """Whether the images are undistorted."""
     cameras: Tuple[Literal["camera_1", "camera_2", "camera_3", "camera_4", "all"], ...] = (
         "camera_1",
         "camera_2",
@@ -171,7 +172,7 @@ class SimulatorDataParser(ADDataParser):
         self.data_dir = Path(config.data)
         self.agent_id = config.agent_id
         self.label_file = self.data_dir / "labels" / "label_nerf_sample.json"
-        self.sensor_params_file = self.data_dir / "labels" / "sensor_parameters.json"
+        self.sensor_params_file = self.data_dir / "labels" / "sensor_parameters.json" if  not config.is_undistorted else self.data_dir / "labels" / "sensor_parameters_undistorted.json"
         self.ego_object_id = EGO_OBJECT_ID
         self.stationary_displacement_threshold = config.stationary_displacement_threshold
         
@@ -524,12 +525,15 @@ class SimulatorDataParser(ADDataParser):
                 cy = intrinsic.get("cy", 388.5)
                 intrinsic_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
                 intrinsics.append(intrinsic_matrix)
-                filenames.append( self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"{self.config.agent_id}/{camera_id}"]["uri"])
+                uri =  self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"{self.config.agent_id}/{camera_id}"]["uri"]
+                if self.config.is_undistorted:
+                    uri = Path(str(uri).replace(camera_id, f"{camera_id}_undistorted"))
+                filenames.append(uri)
                 times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
                 idxs.append(cameras.index(camera_id))
                 heights.append(self.streams_data[f"{self.config.agent_id}/{camera_id}"]["stream_properties"]["height"] - (250 if camera_id == "camera_1" else 0))
                 widths.append(self.streams_data[f"{self.config.agent_id}/{camera_id}"]["stream_properties"]["width"])
-                distortion_params.append([-0.10086563, 0.06112929, -0.04727966, 0.00974163, 0.0, 0.0])
+                # distortion_params.append([-0.10086563, 0.06112929, -0.04727966, 0.00974163, 0.0, 0.0])
         # Convert to tensors
         intrinsics = torch.from_numpy(np.array(intrinsics)).float()
         poses = torch.tensor(np.array(poses), dtype=torch.float32)
@@ -537,7 +541,7 @@ class SimulatorDataParser(ADDataParser):
         idxs = torch.tensor(idxs).int().unsqueeze(-1)
         heights = torch.tensor(heights).int()
         widths = torch.tensor(widths).int()
-        distortion_params = torch.tensor(np.array(distortion_params), dtype=torch.float32)
+        # distortion_params = torch.tensor(np.array(distortion_params), dtype=torch.float32)
         cameras = Cameras(
             fx=intrinsics[:, 0, 0],
             fy=intrinsics[:, 1, 1],
@@ -545,7 +549,7 @@ class SimulatorDataParser(ADDataParser):
             cy=intrinsics[:, 1, 2],
             height=heights,
             width=widths,
-            distortion_params=distortion_params,
+            # distortion_params=distortion_params,
             camera_to_worlds=poses,
             camera_type=CameraType.PERSPECTIVE,
             times=times,
