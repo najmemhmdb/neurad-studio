@@ -65,14 +65,7 @@
         "--pipeline.model.field.grid.actor.num_levels=2",
         "--pipeline.model.camera-optimizer.mode=SO3xR3",
         "--pipeline.model.field.grid.actor.log2_hashmap_size=11",
-        "import logging
-import torch
-from typing import Optional, Union
-from some_module import CameraLidarTemporalOptimizerConfig, CameraOptimizer, pose_utils, exp_map_SO3xR3, Int, Float  # Import necessary modules
-
-# Set up basic logging configuration
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)",
+        "--pipeline.datamanager.num_processes=0",
         "--pipeline.datamanager.train-num-lidar-rays-per-batch=1280",
         "--pipeline.datamanager.eval-num-lidar-rays-per-batch=128",
         "--pipeline.datamanager.train-num-rays-per_batch=2048",
