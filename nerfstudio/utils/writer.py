@@ -99,7 +99,7 @@ def put_scalar(name: str, scalar: Any, step: int):
 
 
 @check_main_thread
-def record_xyz(name: str, xyz: Union[Tensor, List[float], tuple], step: int, maxlen: int = 2000) -> None:
+def record_xyz(name: str, xyz: Union[Tensor, List[float], tuple], step: int, maxlen: int = 20000) -> None:
     """Record xyz history into GLOBAL_BUFFER so we can plot trajectories later."""
     if isinstance(name, EventName):
         name = name.value

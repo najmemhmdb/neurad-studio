@@ -415,10 +415,11 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         self.step_counter = 0
         self.camera_count = 6
         self.sequence_length = num_cameras // (self.camera_count + 1)
-        self.ext_init, ext_noisy = self.load_init_extrinsics()
-        self.extrinsics = torch.nn.Parameter(ext_noisy)
-        self.extrinsics.requires_grad_(True)
-        self.offsets = torch.nn.Parameter(torch.tensor([[0.0],[-0.010797],[0.010783],[-0.050045],[-0.031357],[0.03129]]).to(device))
+        self.ext_init, ext_noisy = self.load_init_extrinsics() # [num_cams, 6]
+        self.extrinsics_trans = torch.nn.Parameter(ext_noisy[:, :3])  # [num_cams, 3]
+        self.extrinsics_rot   = torch.nn.Parameter(ext_noisy[:, 3:])  # [num_cams, 3]
+
+        self.offsets = torch.nn.Parameter(torch.tensor([[0.0], [-0.010797], [0.010783], [-0.050045], [-0.031357], [0.03129]]).to(device))
         self.offsets.requires_grad_(False)
         self.lidar2w = kwargs["lidar2w"].cuda()
         self.camera_to_worlds = torch.zeros((self.camera_count*self.sequence_length, 12), device=self.device)
@@ -533,7 +534,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             lidar2sensor_list_gt.append(xi)
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            l2sensor_4x4_noisy[:3, 3]  += ((0.05 * i) + 0.15)
+            l2sensor_4x4_noisy[:3, 3]  += ((0.02 * i) + 0.08)
             lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
             xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
             lidar2sensor_list_noisy.append(xi_noisy)
@@ -588,9 +589,9 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                 camera_indices_unique = torch.unique(camera_indices.clone().detach())
                 for idx in camera_indices_unique:
                     idx_mask = (ext_indices.clone().detach() // self.sequence_length) == idx
-                    self.errors[idx.item()]['x'].append([self.step_counter, self.extrinsics[idx.item()][0].item() - self.ext_init[idx.item()][0].item()])
-                    self.errors[idx.item()]['y'].append([self.step_counter, self.extrinsics[idx.item()][1].item() - self.ext_init[idx.item()][1].item()])
-                    self.errors[idx.item()]['z'].append([self.step_counter, self.extrinsics[idx.item()][2].item() - self.ext_init[idx.item()][2].item()])
+                    self.errors[idx.item()]['x'].append([self.step_counter, self.extrinsics_trans[idx.item()][0].item() - self.ext_init[idx.item()][0].item()])
+                    self.errors[idx.item()]['y'].append([self.step_counter, self.extrinsics_trans[idx.item()][1].item() - self.ext_init[idx.item()][1].item()])
+                    self.errors[idx.item()]['z'].append([self.step_counter, self.extrinsics_trans[idx.item()][2].item() - self.ext_init[idx.item()][2].item()])
                 
                     
             # === periodically render & save ===
@@ -646,7 +647,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
     def _get_ext_adjustment(self) -> Float[Tensor, "num_cameras 6"]:
         """Get the pose adjustment."""
-        return self.extrinsics
+        return torch.cat([self.extrinsics_trans, self.extrinsics_rot], dim=-1)
     
     def _get_adjustment(self) -> Float[Tensor, "num_cameras 6"]:
         """Get the pose adjustment."""
@@ -690,10 +691,9 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
     def get_param_groups(self, param_groups: dict) -> None:
         """Get camera optimizer parameters"""
-        camera_opt_params = list(self.parameters())
         if self.config.mode != "off":
-            assert len(camera_opt_params) > 0
-            param_groups["camera_opt"] = camera_opt_params
+            param_groups["camera_opt_trans"] = [self.extrinsics_trans]
+            param_groups["camera_opt_rot"]   = [self.extrinsics_rot]
         else:
             assert len(camera_opt_params) == 0
 
