@@ -34,7 +34,8 @@ from nerfstudio.configs import base_config as cfg
 from nerfstudio.utils.decorators import check_main_thread, decorate_all
 from nerfstudio.utils.printing import human_format
 from nerfstudio.utils.rich_utils import CONSOLE
-
+import numpy as np
+import matplotlib.pyplot as plt
 
 def to8b(x):
     """Converts a torch tensor to 8 bit"""
@@ -95,6 +96,129 @@ def put_scalar(name: str, scalar: Any, step: int):
         name = name.value
 
     EVENT_STORAGE.append({"name": name, "write_type": EventType.SCALAR, "event": scalar, "step": step})
+
+
+@check_main_thread
+def record_xyz(name: str, xyz: Union[Tensor, List[float], tuple], step: int, maxlen: int = 2000) -> None:
+    """Record xyz history into GLOBAL_BUFFER so we can plot trajectories later."""
+    if isinstance(name, EventName):
+        name = name.value
+
+    if isinstance(xyz, torch.Tensor):
+        vals = xyz.detach().flatten().to("cpu").tolist()
+    else:
+        vals = list(xyz)
+
+    if len(vals) != 3:
+        raise ValueError(f"record_xyz expected 3 values, got {len(vals)} for '{name}'")
+
+    traj = GLOBAL_BUFFER.setdefault("traj", {})
+    buf = traj.setdefault(name, [])
+    buf.append((int(step), (float(vals[0]), float(vals[1]), float(vals[2]))))
+    if len(buf) > maxlen:
+        del buf[: len(buf) - maxlen]
+
+
+def _fig_to_image_tensor(fig) -> torch.Tensor:
+    """Convert a Matplotlib figure to a float torch tensor [H,W,3] in [0,1]."""
+
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+
+    # RGBA buffer (h, w, 4)
+    rgba = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+    rgb = rgba[..., :3]  # drop alpha
+    return torch.from_numpy(rgb).float() / 255.0
+
+@check_main_thread
+def put_xyz_trajectory_plots(
+    name: str,
+    step: int,
+    gt_name: str | None = None,
+    loss_fn=None,
+    grid_res: int = 80,
+    pad_frac: float = 0.2,
+    fixed_mode: str = "final",   # "final" or "initial"
+    gt_once: bool = True,        # GT as one point (fixed)
+    tb_step: int | None = None,  # <-- NEW: if set (e.g. 0) overwrites same TB image
+) -> None:
+    if isinstance(name, EventName):
+        name = name.value
+
+    traj = GLOBAL_BUFFER.get("traj", {})
+    hist_all = traj.get(name, None)
+    if not hist_all or len(hist_all) < 2:
+        return
+
+    # --- clip to <= current step so history never "restarts" due to out-of-order writes ---
+    hist = [(s, v) for (s, v) in hist_all if int(s) <= int(step)]
+    if len(hist) < 2:
+        return
+
+    gt_hist_all = traj.get(gt_name, None) if gt_name else None
+    gt_hist = None
+    if gt_hist_all:
+        gt_hist = [(s, v) for (s, v) in gt_hist_all if int(s) <= int(step)]
+
+    pts = np.array([v for _, v in hist], dtype=np.float32)  # [T,3]
+    xs, ys, zs = pts[:, 0], pts[:, 1], pts[:, 2]
+
+    # choose one GT point (since GT is fixed)
+    gt_pt = None
+    if gt_hist and len(gt_hist) > 0:
+        idx = 0 if fixed_mode == "initial" else -1
+        gt_pt = np.array(gt_hist[idx][1], dtype=np.float32)  # [3]
+
+    def _bounds(a: np.ndarray, extra: float | None = None):
+        lo = float(a.min())
+        hi = float(a.max())
+        if extra is not None:
+            lo = min(lo, float(extra))
+            hi = max(hi, float(extra))
+        span = hi - lo
+        if span == 0.0:
+            span = 1.0
+        pad = span * pad_frac
+        return lo - pad, hi + pad
+
+    def _plot_plane(plane: str, x: np.ndarray, v: np.ndarray, xlab: str, vlab: str, v_idx: int):
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=140)
+
+        ax.plot(x, v, linewidth=1.8, label="pred")
+
+        if gt_name and gt_pt is not None:
+            if gt_once:
+                ax.scatter([float(gt_pt[0])], [float(gt_pt[v_idx])],
+                           marker="x", s=70, linewidths=2.0, label="gt")
+            else:
+                gt_pts = np.array([vv for _, vv in gt_hist], dtype=np.float32)
+                ax.plot(gt_pts[:, 0], gt_pts[:, v_idx], linestyle="--", linewidth=1.8, label="gt")
+            ax.legend(loc="best")
+
+        # include GT in bounds so it always stays visible
+        x_extra = float(gt_pt[0]) if (gt_pt is not None) else None
+        v_extra = float(gt_pt[v_idx]) if (gt_pt is not None) else None
+        xlo, xhi = _bounds(x, extra=x_extra)
+        vlo, vhi = _bounds(v, extra=v_extra)
+        ax.set_xlim(xlo, xhi)
+        ax.set_ylim(vlo, vhi)
+
+        ax.set_xlabel(xlab)
+        ax.set_ylabel(vlab)
+        ax.grid(True, alpha=0.25)
+        ax.set_title(f"{name} trajectory: {plane} (data<=step {int(step)})")
+        fig.tight_layout()
+
+        img = _fig_to_image_tensor(fig)
+        plt.close(fig)
+
+        log_step = int(step if tb_step is None else tb_step)
+        put_image(f"{name}/{plane}", img, log_step)
+
+    _plot_plane("traj_xy", xs, ys, "x", "y", v_idx=1)
+    _plot_plane("traj_xz", xs, zs, "x", "z", v_idx=2)
+
+
 
 
 @check_main_thread

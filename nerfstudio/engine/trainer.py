@@ -311,7 +311,7 @@ class Trainer:
                             )
 
                         # time the forward pass
-                        loss, loss_dict, metrics_dict = self.train_iteration(step)
+                        loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.train_iteration(step)
 
                         # training callbacks after the training iteration
                         for callback in self.callbacks:
@@ -331,7 +331,11 @@ class Trainer:
                     )
 
                 self._update_viewer_state(step)
-
+                for i in range(len(camera_xyz)):
+                    writer.record_xyz(name=f"Camera Position {i}", xyz=camera_xyz[i], step=step)
+                    writer.record_xyz(name=f"train/xyz_gt {i}", xyz=camera_xyz_gt[i], step=step)
+                    diff = (camera_xyz[i].detach().cpu() - camera_xyz_gt[i].detach().cpu())
+                    writer.put_scalar(name=f"train/xyz_l2_error {i}", scalar=float(diff.norm().cpu()), step=step)
                 # a batch of train rays
                 if step_check(step, self.config.logging.steps_per_log, run_at_zero=True):
                     writer.put_scalar(name="Train Loss", scalar=loss, step=step)
@@ -345,6 +349,7 @@ class Trainer:
                     writer.put_scalar(
                         name="GPU Memory (MB)", scalar=torch.cuda.max_memory_allocated() / (1024**2), step=step
                     )
+                
 
                 # Do not perform evaluation if there are no validation images
                 if self.pipeline.datamanager.eval_dataset:
@@ -359,6 +364,10 @@ class Trainer:
                     self.save_checkpoint(step)
 
                 writer.write_out_storage()
+
+                if step % 100 == 0:
+                    for i in range(len(camera_xyz)):
+                        writer.put_xyz_trajectory_plots(name=f"Camera Position {i}", gt_name=f"train/xyz_gt {i}", step=step)
             
         end_time = time.time()
         # save checkpoint at the end of training
@@ -555,7 +564,7 @@ class Trainer:
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
 
         with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
-            _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
+            _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
             loss = functools.reduce(torch.add, loss_dict.values())
         self.grad_scaler.scale(loss).backward()  # type: ignore
         needs_step = [
@@ -583,7 +592,7 @@ class Trainer:
             self.optimizers.scheduler_step_all(step)
 
         # Merging loss and metrics dict into a single output.
-        return loss, loss_dict, metrics_dict  # type: ignore
+        return loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt  # type: ignore
 
     @check_eval_enabled
     @profiler.time_function
