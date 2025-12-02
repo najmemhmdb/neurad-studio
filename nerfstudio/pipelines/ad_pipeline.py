@@ -97,7 +97,7 @@ class ADPipeline(VanillaPipeline):
 
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
 
-        return model_outputs, loss_dict, metrics_dict
+        return model_outputs, loss_dict, metrics_dict, self.model.camera_optimizer.extrinsics.clone()[:,:3] , self.model.camera_optimizer.ext_init.clone()[:,:3]
 
     @profiler.time_function
     def get_eval_loss_dict(self, step: int):
