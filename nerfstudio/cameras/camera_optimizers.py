@@ -522,7 +522,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             phi = rotmat_to_rotvec_match_exp(R)
             return torch.cat([t, phi])
                     
-        for sensor in sensors:
+        for i,sensor in enumerate(sensors):
             l2s = l2s_dict[sensor]
             l2sensor = {}
             l2sensor["position"] = l2s["extrinsic"]["transform"]["translation"]
@@ -533,7 +533,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             lidar2sensor_list_gt.append(xi)
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            l2sensor_4x4_noisy[:3, 3]  += 0.15
+            l2sensor_4x4_noisy[:3, 3]  += ((0.05 * i) + 0.15)
             lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
             xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
             lidar2sensor_list_noisy.append(xi_noisy)

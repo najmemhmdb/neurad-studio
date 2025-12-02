@@ -157,10 +157,10 @@ class PandaSet(ADDataParser):
         return LANE_SHIFT_SIGN.get(sequence, 1)
     
 
-    def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray) -> np.ndarray:
+    def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray, idx: int) -> np.ndarray:
         """Add noise to the poses."""
-        random_noise = np.random.normal(0, 0.2, 1)
-        extrinsic_l2cam[:3, 3] += random_noise
+        
+        extrinsic_l2cam[:3, 3] += (0.15 + (0.05 * idx))
         new_cam2w = l2w @ np.linalg.inv(extrinsic_l2cam)
         return new_cam2w
 
@@ -197,7 +197,7 @@ class PandaSet(ADDataParser):
                 curr_cam = self.sequence.camera[camera]
                 file_path = curr_cam._data_structure[i]
                 # pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
-                pose = self._add_noise(l2w, l2cam)
+                pose = self._add_noise(l2w, l2cam, cameras.index(camera))
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
                 
