@@ -160,7 +160,7 @@ class PandaSet(ADDataParser):
     def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray, idx: int) -> np.ndarray:
         """Add noise to the poses."""
         
-        extrinsic_l2cam[:3, 3] += (0.08 + (0.02 * idx))
+        extrinsic_l2cam[:3, 3] -= (0.08 + (0.02 * idx))
         new_cam2w = l2w @ np.linalg.inv(extrinsic_l2cam)
         return new_cam2w
 
