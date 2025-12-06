@@ -49,7 +49,7 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.writer import EventName, TimeWriter
 from nerfstudio.viewer.viewer import Viewer as ViewerState
 from nerfstudio.viewer_legacy.server.viewer_state import ViewerLegacyState
-
+import copy
 TRAIN_INTERATION_OUTPUT = Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
 TORCH_DEVICE = str
 
@@ -142,7 +142,12 @@ class TrainerConfig(ExperimentConfig):
     """Optionally log gradients during training"""
     gradient_accumulation_steps: Dict[str, int] = field(default_factory=lambda: {})
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
-
+    reset_at_steps: List[int] = field(default_factory=lambda: [0, 2000, 4000, 6000])   # set None to disable resetting
+    """Optionally specify the step to reset the model and optimizer states."""
+    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [0.25, 0.5, 0.75, 1.0])
+    """Optionally specify the camera resolution scale factor to use at the reset steps."""
+    _reset_exclude_key_substrings: List[str] = field(default_factory=lambda: ["camera_optimizer."])
+    """Optionally specify the key substrings to exclude from the reset."""
 
 class Trainer:
     """Trainer class
@@ -198,6 +203,81 @@ class Trainer:
 
         self.viewer_state = None
 
+
+
+    def _recursive_to_cpu(self, obj):
+        """Move tensors in (nested) containers to CPU so the snapshot doesn't double VRAM."""
+        if torch.is_tensor(obj):
+            return obj.detach().cpu()
+        if isinstance(obj, dict):
+            return {k: self._recursive_to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._recursive_to_cpu(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._recursive_to_cpu(v) for v in obj)
+        return copy.deepcopy(obj)
+
+    def _capture_reset_snapshot(self) -> Dict[str, object]:
+        # pipeline weights
+        pipe_sd = self.pipeline.module.state_dict() if hasattr(self.pipeline, "module") else self.pipeline.state_dict()
+
+        snap = {
+            "pipeline": self._recursive_to_cpu(pipe_sd),
+            "optimizers": {k: self._recursive_to_cpu(opt.state_dict()) for k, opt in self.optimizers.optimizers.items()},
+            "schedulers": {k: self._recursive_to_cpu(sch.state_dict()) for k, sch in self.optimizers.schedulers.items()},
+            "scaler": self._recursive_to_cpu(self.grad_scaler.state_dict()),
+        }
+        return snap
+    
+
+    def _move_optimizer_state_to_device(self, optimizer: torch.optim.Optimizer, device: str) -> None:
+        dev = torch.device(device)
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(dev)
+    
+    def _reset_model_weights_except(self) -> None:
+        snap_sd = self._reset_snapshot["pipeline"]  # CPU snapshot
+        cur_sd = self.pipeline.module.state_dict() if hasattr(self.pipeline, "module") else self.pipeline.state_dict()
+
+        for k, v in snap_sd.items():
+            if any(s in k for s in self.config._reset_exclude_key_substrings):
+                continue  # keep current (camera) params
+            cur_sd[k] = v  # restore everything else
+
+        if hasattr(self.pipeline, "module"):
+            self.pipeline.module.load_state_dict(cur_sd, strict=True)
+        else:
+            self.pipeline.load_state_dict(cur_sd, strict=True)
+
+    
+    def _reset_model_and_optimizers(self) -> None:
+        
+        self._reset_model_weights_except()
+        snap = self._reset_snapshot
+
+        # Reset optimizers + schedulers
+        for k, opt in self.optimizers.optimizers.items():
+            opt.load_state_dict(copy.deepcopy(snap["optimizers"][k]))
+            self._move_optimizer_state_to_device(opt, self.device)
+
+        for k, sch in self.optimizers.schedulers.items():
+            sch.load_state_dict(copy.deepcopy(snap["schedulers"][k]))
+
+        # Reset grad scaler
+        self.grad_scaler.load_state_dict(copy.deepcopy(snap["scaler"]))
+
+        # Clear any leftover grads
+        for opt in self.optimizers.optimizers.values():
+            opt.zero_grad(set_to_none=True)
+
+        # Reset trackers so early stopping / “best” checkpoint logic doesn’t get confused
+        self.early_stopping_tracker.best = None
+        self.early_stopping_tracker.latest = None
+        self.checkpoint_saving_tracker.best = None
+        self.checkpoint_saving_tracker.latest = None
+    
     def setup(self, test_mode: Literal["test", "val", "inference"] = "val") -> None:
         """Setup the Trainer by calling other setup functions.
 
@@ -217,6 +297,8 @@ class Trainer:
         self.optimizers = self.setup_optimizers()
         self._load_checkpoint()  # load checkpoint before setting up optimizers in case parameters are re-registered
         
+
+        self._reset_snapshot = self._capture_reset_snapshot()
 
         # set up viewer if enabled
         viewer_log_path = self.base_dir / self.config.viewer.relative_log_filename
@@ -300,6 +382,12 @@ class Trainer:
             for step in range(self._start_step, self._start_step + num_iterations):
                 while self.training_state == "paused":
                     time.sleep(0.01)
+
+                if self.config.reset_at_steps is not None and step in self.config.reset_at_steps:
+                    with self.train_lock:  # important (viewer/eval might access the pipeline)
+                        CONSOLE.log(f"[yellow]Resetting model+optimizer states at step {step}[/yellow]")
+                        self._reset_model_and_optimizers()
+                        self.pipeline.datamanager.update_dataset_resolution(self.config.camera_res_scale_factor_at_reset[self.config.reset_at_steps.index(step)])
                 with self.train_lock:
                     with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
                         self.pipeline.train()
