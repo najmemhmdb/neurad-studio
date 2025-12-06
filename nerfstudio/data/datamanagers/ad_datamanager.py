@@ -21,10 +21,24 @@ import torch
 from rich.console import Console
 
 from nerfstudio.cameras.lidars import transform_points
-from nerfstudio.data.datamanagers.image_lidar_datamanager import ImageLidarDataManager, ImageLidarDataManagerConfig
+from nerfstudio.data.datamanagers.image_lidar_datamanager import (
+    ImageLidarDataManager,
+    ImageLidarDataManagerConfig,
+    ImageLidarDataProcessor,
+    _cache_images,
+    _cache_points,
+    lidar_packed_collate,
+)
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.pixel_samplers import ScaledPatchSamplerConfig
 from nerfstudio.data.utils.data_utils import remove_dynamic_points
+from nerfstudio.data.utils.dataloaders import (
+    CacheDataloader,
+    FixedIndicesEvalDataloader,
+    RandIndicesEvalDataloader,
+)
+from nerfstudio.model_components.ray_generators import RayGenerator
+
 
 CONSOLE = Console(width=120)
 
@@ -110,6 +124,168 @@ class ADDataManager(ImageLidarDataManager):
         return torch.cat(
             [transform_points(pc[:, :3], l2w) for pc, l2w in zip(point_clouds, lidars.lidar_to_worlds)], dim=0
         )
+
+    
+
+    def update_dataset_resolution(self, new_scale_factor: float):
+        """
+        Updates the dataset resolution, rescales cameras, clears caches,
+        and restarts the dataloader to propagate changes to workers.
+        
+        This function handles the complete resolution update process:
+        1. Updates camera intrinsics (fx, fy, cx, cy, width, height)
+        2. Updates dataset scale_factor (used when loading images)
+        3. Recreates cached images at new resolution
+        4. Restarts parallel data processors with new cached images
+        5. Updates pixel samplers and ray generators
+        """
+        
+        # 2. Get current scale factor
+        old_scale_factor = self.train_dataset.scale_factor
+        
+        # Avoid doing work if scale hasn't changed
+        if abs(new_scale_factor - old_scale_factor) < 1e-6:
+            return
+
+        print(f"[DataManager] Updating resolution. Scale: {old_scale_factor} -> {new_scale_factor}")
+
+        # 3. Calculate relative scale for camera intrinsics
+        # rescale_output_resolution multiplies by the scaling factor, so we need
+        # to calculate the ratio from old to new
+        rescale_ratio = new_scale_factor / old_scale_factor
+        
+        # 4. Update Camera Intrinsics (fx, fy, cx, cy, width, height)
+        self.train_dataset.cameras.rescale_output_resolution(rescale_ratio)
+        
+        # 5. Update the dataset's internal scale factor
+        # This is used by get_numpy_image() to resize images when loading
+        self.train_dataset.scale_factor = new_scale_factor
+        
+        # 5b. Also update eval dataset if it exists
+        if hasattr(self, "eval_dataset") and self.eval_dataset is not None:
+            eval_old_scale = self.eval_dataset.scale_factor
+            eval_rescale_ratio = new_scale_factor / eval_old_scale
+            self.eval_dataset.cameras.rescale_output_resolution(eval_rescale_ratio)
+            self.eval_dataset.scale_factor = new_scale_factor
+
+        # 6. Handle ImageLidarDataManager (parallel data processors)
+        if hasattr(self, "data_procs") and self.data_procs is not None:
+            # Stop existing data processors
+            if self.use_mp:
+                for proc in self.data_procs:
+                    proc.terminate()
+                    proc.join()
+            
+            # Clear data queue to remove any stale batches
+            self.clear_data_queue()
+            
+            # Recreate pixel sampler with updated dataset
+            self.train_pixel_sampler = self._get_pixel_sampler(self.train_dataset, self.config.train_num_rays_per_batch)
+            
+            # Recreate cached images at new resolution
+            # This is critical - images must be reloaded at the new scale_factor
+            cached_images = _cache_images(self.train_dataset, self.config.max_thread_workers, self.config.collate_fn)
+            cached_points = _cache_points(self.train_lidar_dataset, self.config.max_thread_workers, lidar_packed_collate)
+            
+            # Recreate data processors with new cached images
+            self.data_procs = [
+                ImageLidarDataProcessor(
+                    out_queue=self.data_queue,
+                    func_queue=func_queue,
+                    config=self.config,
+                    dataparser_outputs=self.train_dataparser_outputs,
+                    image_dataset=self.train_dataset,
+                    pixel_sampler=self.train_pixel_sampler,
+                    lidar_dataset=self.train_lidar_dataset,
+                    point_sampler=self.train_point_sampler,
+                    cached_images=cached_images,
+                    cached_points=cached_points,
+                )
+                for func_queue in self.func_queues
+            ]
+            
+            # Restart processes
+            if self.use_mp:
+                for proc in self.data_procs:
+                    proc.start()
+                print("[DataManager] Restarted data processes with new resolution")
+        
+        # 7. Handle eval dataloader (if using CacheDataloader)
+        # CacheDataloader caches images in cached_collated_batch during initialization
+        # We must recreate it entirely so it reloads images at the new resolution
+        if hasattr(self, "eval_image_dataloader") and hasattr(self, "eval_dataset"):
+            # Delete old iterator
+            if hasattr(self, "iter_eval_image_dataloader"):
+                del self.iter_eval_image_dataloader
+            
+            # Recreate eval dataloader with updated dataset
+            # This will reload images at the new resolution
+            self.eval_image_dataloader = CacheDataloader(
+                self.eval_dataset,
+                num_images_to_sample_from=self.config.eval_num_images_to_sample_from,
+                num_times_to_repeat_images=self.config.eval_num_times_to_repeat_images,
+                device=self.device,
+                num_workers=self.world_size * 4,
+                pin_memory=True,
+                collate_fn=self.config.collate_fn,
+                exclude_batch_keys_from_device=self.exclude_batch_keys_from_device,
+            )
+            self.iter_eval_image_dataloader = iter(self.eval_image_dataloader)
+            
+            # Recreate eval pixel sampler and ray generator
+            self.eval_pixel_sampler = self._get_pixel_sampler(self.eval_dataset, self.config.eval_num_rays_per_batch)
+            self.eval_ray_generator = RayGenerator(self.eval_dataset.cameras.to(self.device))
+            
+            # Also recreate eval dataloaders if they exist (from ParallelDataManager.setup_eval)
+            if hasattr(self, "fixed_indices_eval_dataloader"):
+                self.fixed_indices_eval_dataloader = FixedIndicesEvalDataloader(
+                    dataset=self.eval_dataset,
+                    device=self.device,
+                    num_workers=self.world_size * 4,
+                )
+            if hasattr(self, "eval_dataloader"):
+                self.eval_dataloader = RandIndicesEvalDataloader(
+                    dataset=self.eval_dataset,
+                    device=self.device,
+                    num_workers=self.world_size * 4,
+                )
+        
+        # 8. Handle train dataloader (if using CacheDataloader - for non-parallel case)
+        # NOTE: This section is for VanillaDataManager, NOT for ImageLidarDataManager/ADDataManager
+        # ADDataManager uses parallel data processors (data_procs) instead of train_image_dataloader
+        # So hasattr(self, "train_image_dataloader") will be False for ADDataManager
+        # Only recreate if train_image_dataloader exists (non-parallel case)
+        if hasattr(self, "train_image_dataloader") and not hasattr(self, "data_procs"):
+            # Delete old iterator and dataloader
+            if hasattr(self, "iter_train_image_dataloader"):
+                del self.iter_train_image_dataloader
+            del self.train_image_dataloader
+            
+            # Recreate train dataloader with updated dataset
+            # This will reload images at the new resolution
+            self.train_image_dataloader = CacheDataloader(
+                self.train_dataset,
+                num_images_to_sample_from=self.config.train_num_images_to_sample_from,
+                num_times_to_repeat_images=self.config.train_num_times_to_repeat_images,
+                device=self.device,
+                num_workers=self.world_size * 4,
+                pin_memory=True,
+                collate_fn=self.config.collate_fn,
+                exclude_batch_keys_from_device=self.exclude_batch_keys_from_device,
+            )
+            self.iter_train_image_dataloader = iter(self.train_image_dataloader)
+            
+            # Recreate train pixel sampler and ray generator
+            self.train_pixel_sampler = self._get_pixel_sampler(self.train_dataset, self.config.train_num_rays_per_batch)
+            self.train_ray_generator = RayGenerator(self.train_dataset.cameras.to(self.device))
+        
+        # 9. Clear any dataset-level image caches
+        if hasattr(self.train_dataset, "image_cache"):
+            self.train_dataset.image_cache.clear()
+        if hasattr(self, "eval_dataset") and hasattr(self.eval_dataset, "image_cache"):
+            self.eval_dataset.image_cache.clear()
+        
+        print(f"[DataManager] Resolution update complete. New image dimensions: {self.train_dataset.cameras.height[0].item()}x{self.train_dataset.cameras.width[0].item()}")
 
 
 def _find_smallest_crop(dim: int, divider: int):
