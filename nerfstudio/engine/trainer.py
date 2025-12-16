@@ -34,7 +34,6 @@ from rich import box, style
 from rich.panel import Panel
 from rich.table import Table
 from torch.cuda.amp.grad_scaler import GradScaler
-
 from nerfstudio.configs.base_config import InstantiateConfig
 from nerfstudio.configs.experiment_config import ExperimentConfig
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
@@ -142,9 +141,9 @@ class TrainerConfig(ExperimentConfig):
     """Optionally log gradients during training"""
     gradient_accumulation_steps: Dict[str, int] = field(default_factory=lambda: {})
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
-    reset_at_steps: List[int] = field(default_factory=lambda: [0, 2000, 4000, 6000])   # set None to disable resetting
+    reset_at_steps: List[int] = field(default_factory=lambda: [0])   # set None to disable resetting
     """Optionally specify the step to reset the model and optimizer states."""
-    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [0.25, 0.5, 0.75, 1.0])
+    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [1.0])
     """Optionally specify the camera resolution scale factor to use at the reset steps."""
     _reset_exclude_key_substrings: List[str] = field(default_factory=lambda: ["camera_optimizer."])
     """Optionally specify the key substrings to exclude from the reset."""
@@ -295,6 +294,7 @@ class Trainer:
             grad_scaler=self.grad_scaler,
         )
         self.optimizers = self.setup_optimizers()
+        print(self.config.load_dir)
         self._load_checkpoint()  # load checkpoint before setting up optimizers in case parameters are re-registered
         
 
@@ -380,6 +380,7 @@ class Trainer:
             step = 0
             start_time = time.time()
             for step in range(self._start_step, self._start_step + num_iterations):
+
                 while self.training_state == "paused":
                     time.sleep(0.01)
 
@@ -568,12 +569,14 @@ class Trainer:
                 # NOTE: this is specific to the checkpoint name format
                 load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
             load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
+
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
             loaded_state = torch.load(load_path, map_location="cpu")
             loaded_state["step"] = (
                 self.config.training_start_step if self.config.training_start_step is not None else loaded_state["step"]
             )
             self._start_step = loaded_state["step"] + 1
+            
             # load the checkpoints for pipeline, optimizers, and gradient scalar
             self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
             if self.config.load_optimizer:
@@ -654,6 +657,12 @@ class Trainer:
         with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
             _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
             loss = functools.reduce(torch.add, loss_dict.values())
+        grad_norm_per_term(loss_dict, self.pipeline.model.parameters(), every=1, step=step, log_file=str(self.base_dir / "grad_norms.csv"), rank=getattr(self, "local_rank", 0))
+        torch.autograd.set_detect_anomaly(True)
+        scale = self.grad_scaler.get_scale()
+        with open(str(self.base_dir / "scaler.csv"), "a", buffering=1) as f:
+            f.write(f"{step},{scale}\n")
+            
         self.grad_scaler.scale(loss).backward()  # type: ignore
         needs_step = [
             group
@@ -661,7 +670,7 @@ class Trainer:
             if step % self.gradient_accumulation_steps[group] == self.gradient_accumulation_steps[group] - 1
         ]
         self.optimizers.optimizer_scaler_step_some(self.grad_scaler, needs_step)
-
+        
         if self.config.log_gradients:
             total_grad = 0
             for tag, value in self.pipeline.model.named_parameters():
@@ -731,3 +740,53 @@ class Trainer:
 def detach_items_if_tensor(dict):
     """Detach items in dictionary if they are tensors"""
     return {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in dict.items()}
+
+
+def grad_norm_per_term(loss_dict, params, *, every=100, step=0, log_file=None, rank=0):
+    if step < 9180:
+        return
+    if rank != 0:   # avoid multiple processes writing to same file
+        return
+
+    params = [p for p in params if p.requires_grad]
+
+    rows = []
+    t = time.time()
+
+    for name, term in loss_dict.items():
+        if term is None:
+            continue
+
+        grads = torch.autograd.grad(
+            term,
+            params,
+            retain_graph=True,
+            allow_unused=True
+        )
+
+        sq_sum = 0.0
+        max_abs = 0.0
+        any_grad = False
+
+        for g in grads:
+            if g is None or g.numel() == 0:
+                continue
+            gf = g.detach().float()
+            sq_sum += gf.pow(2).sum().item()
+            max_abs = max(max_abs, gf.abs().max().item())
+            any_grad = True
+
+        if any_grad:
+            norm = sq_sum ** 0.5
+            rows.append(f"{step},{t},{name},{norm:.6e},{max_abs:.6e}")
+        else:
+            rows.append(f"{step},{t},{name},,")  # no grads
+
+    if log_file is not None:
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not log_file.exists()
+        with open(log_file, "a", buffering=1) as f:  # line-buffered
+            if new_file:
+                f.write("step,unix_time,term,grad_norm,grad_maxabs\n")
+            f.write("\n".join(rows) + "\n")
