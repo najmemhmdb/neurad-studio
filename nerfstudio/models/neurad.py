@@ -261,6 +261,7 @@ class NeuRADModel(ADModel):
 
         # losses
         self.rgb_loss = MSELoss()
+        self.edge_aware_rgb_loss = MSELoss(reduction="none")
         self.depth_loss = L1Loss(reduction="none")
         self.intensity_loss = MSELoss(reduction="none")
         self.vgg_loss = VGGPerceptualLossPix2Pix()
@@ -275,6 +276,7 @@ class NeuRADModel(ADModel):
         self.mean_rel_l2 = lambda pred, gt: torch.mean(((pred - gt) / gt) ** 2)
         self.rmse = lambda pred, gt: torch.sqrt(torch.mean((pred - gt) ** 2))
         self.chamfer_distance = lambda pred, gt: chamfer_distance(pred, gt, 1_000, True)
+        self.step = 0
 
     @property
     def fields(self) -> list[Union[NeuRADField, NeuRADProposalField]]:
@@ -539,11 +541,12 @@ class NeuRADModel(ADModel):
         loss_dict = {}
         if "image" in batch:
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
-            edges = self.edge_aware_blur(rgb.permute(0, 3, 1, 2), canny_low=0.1, canny_high=0.2, blur_ksize=3, blur_sigma=1.0, dilate_ksize=3)
-            rgb_weighted = rgb * edges.permute(0, 2, 3, 1)
-            image_weighted = image * edges.permute(0, 2, 3, 1)
-            loss_dict["rgb_edge_aware_loss"] = self.rgb_loss(image_weighted, rgb_weighted) * conf.rgb_mult * 50
-            loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult * 0.1
+            # edges = self.edge_aware_blur(image.permute(0, 3, 1, 2), canny_low=0.1, canny_high=0.2, blur_ksize=3, blur_sigma=1.0, dilate_ksize=3)
+            # rgb_weighted = rgb * edges.permute(0, 2, 3, 1)
+            # image_weighted = image * edges.permute(0, 2, 3, 1)
+            # loss_dict["rgb_edge_aware_loss"] = self.rgb_loss(image_weighted, rgb_weighted) * conf.rgb_mult * 50
+            # loss_dict["rgb_edge_aware_loss"] = torch.mean(self.edge_aware_rgb_loss(image, rgb) * edges.permute(0, 2, 3, 1)) * conf.rgb_mult * 50
+            loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult 
             if conf.vgg_mult > 0.0:
                 loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
         if self.training:
@@ -556,11 +559,11 @@ class NeuRADModel(ADModel):
                 prop_depth_mult = conf.prop_lidar_loss_mult * conf.depth_mult
                 prop_carv_mult = conf.prop_lidar_loss_mult * conf.carving_mult
                 for i_prop in range(self.config.num_proposal_rounds):
-                    loss_dict[f"depth_loss_{i_prop}"] = prop_depth_mult * metrics_dict[f"depth_loss_{i_prop}"]
+                    loss_dict[f"depth_loss_{i_prop}"] =  prop_depth_mult * metrics_dict[f"depth_loss_{i_prop}"]
                     loss_dict[f"carving_loss_{i_prop}"] = prop_carv_mult * metrics_dict[f"carving_loss_{i_prop}"]
             assert metrics_dict
             if "depth_loss" in metrics_dict:
-                loss_dict["depth_loss"] = conf.depth_mult * metrics_dict["depth_loss"]
+                loss_dict["depth_loss"] = 200 * multiplier(self.step) * conf.depth_mult * metrics_dict["depth_loss"]
             if "intensity_loss" in metrics_dict:
                 loss_dict["intensity_loss"] = conf.intensity_mult * metrics_dict["intensity_loss"]
             if "carving_loss" in metrics_dict:
@@ -677,6 +680,7 @@ class NeuRADModel(ADModel):
             camera_ray_bundle: ray bundle to calculate outputs over
         """
         if self.training or self.config.use_camopt_in_eval:
+            self.step += 1
             ray_bundle_shape = camera_ray_bundle.shape
             camera_ray_bundle = camera_ray_bundle.flatten()
             self.camera_optimizer.apply_to_raybundle(camera_ray_bundle)
@@ -781,3 +785,10 @@ def render_depth_simple(
 ) -> Float[Tensor, "*batch 1"]:
     steps = (ray_samples.frustums.starts + ray_samples.frustums.ends) / 2
     return nerfacc.accumulate_along_rays(weights[..., 0], values=steps, ray_indices=ray_indices, n_rays=num_rays)
+
+
+def multiplier(step, start=1.0, final=0.1, hold=4000, tau=8000):
+    if step <= hold:
+        return start
+    t = step - hold
+    return final + (start - final) * math.exp(-t / tau)
