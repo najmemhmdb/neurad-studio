@@ -141,9 +141,9 @@ class TrainerConfig(ExperimentConfig):
     """Optionally log gradients during training"""
     gradient_accumulation_steps: Dict[str, int] = field(default_factory=lambda: {})
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
-    reset_at_steps: List[int] = field(default_factory=lambda: [0])   # set None to disable resetting
+    reset_at_steps: List[int] = field(default_factory=lambda: [0, 10, 20])   # set None to disable resetting
     """Optionally specify the step to reset the model and optimizer states."""
-    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [1.0])
+    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [0.35, 0.5, 1.0])
     """Optionally specify the camera resolution scale factor to use at the reset steps."""
     _reset_exclude_key_substrings: List[str] = field(default_factory=lambda: ["camera_optimizer."])
     """Optionally specify the key substrings to exclude from the reset."""
@@ -377,7 +377,7 @@ class Trainer:
         self._init_viewer_state()
         with TimeWriter(writer, EventName.TOTAL_TRAIN_TIME):
             num_iterations = self.config.max_num_iterations
-            step = 0
+            # step = 0
             start_time = time.time()
             for step in range(self._start_step, self._start_step + num_iterations):
 
@@ -657,11 +657,18 @@ class Trainer:
         with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
             _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
             loss = functools.reduce(torch.add, loss_dict.values())
-        grad_norm_per_term(loss_dict, self.pipeline.model.parameters(), every=1, step=step, log_file=str(self.base_dir / "grad_norms.csv"), rank=getattr(self, "local_rank", 0))
+        # grad_norm_per_term(loss_dict, self.pipeline.model.parameters(), every=1, step=step, log_file=str(self.base_dir / "grad_norms.csv"), rank=getattr(self, "local_rank", 0))
         torch.autograd.set_detect_anomaly(True)
-        scale = self.grad_scaler.get_scale()
-        with open(str(self.base_dir / "scaler.csv"), "a", buffering=1) as f:
-            f.write(f"{step},{scale}\n")
+        # scale = self.grad_scaler.get_scale()
+        # with open(str(self.base_dir / "scaler.csv"), "a", buffering=1) as f:
+        #     f.write(f"{step},{scale}\n")
+
+        if not torch.isfinite(loss):
+            print("Non-finite loss!", loss)
+            for k, v in loss_dict.items():
+                if not torch.isfinite(v).all():
+                    print("Bad loss term:", k, v)
+            raise RuntimeError("loss became non-finite")
             
         self.grad_scaler.scale(loss).backward()  # type: ignore
         needs_step = [

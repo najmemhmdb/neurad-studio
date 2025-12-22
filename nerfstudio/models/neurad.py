@@ -502,10 +502,14 @@ class NeuRADModel(ADModel):
                 unreduced_depth_loss[~did_return] *= self.config.loss.non_return_loss_mult
                 # TODO: get rid of quantile mask
                 quantile = torch.quantile(unreduced_depth_loss, self.config.loss.quantile_threshold)
+                # quantile = torch.quantile(unreduced_depth_loss.float(), self.config.loss.quantile_threshold)
                 quantile_mask = (unreduced_depth_loss < quantile).squeeze(-1)
-
+                # quantile_mask = (unreduced_depth_loss <= quantile).squeeze(-1)
                 metrics_dict["depth_loss"] = torch.mean(unreduced_depth_loss[quantile_mask])
-
+                # masked = unreduced_depth_loss[quantile_mask]
+                # if masked.numel() == 0:
+                    # masked = unreduced_depth_loss  # fallback
+                # metrics_dict["depth_loss"] = masked.mean()
                 quant_and_return = quantile_mask & did_return
                 metrics_dict["intensity_loss"] = self.intensity_loss(
                     points_intensities[quant_and_return], outputs["intensity"][quant_and_return]
@@ -563,7 +567,7 @@ class NeuRADModel(ADModel):
                     loss_dict[f"carving_loss_{i_prop}"] = prop_carv_mult * metrics_dict[f"carving_loss_{i_prop}"]
             assert metrics_dict
             if "depth_loss" in metrics_dict:
-                loss_dict["depth_loss"] = 200 * multiplier(self.step) * conf.depth_mult * metrics_dict["depth_loss"]
+                loss_dict["depth_loss"] = 10 * conf.depth_mult * metrics_dict["depth_loss"]
             if "intensity_loss" in metrics_dict:
                 loss_dict["intensity_loss"] = conf.intensity_mult * metrics_dict["intensity_loss"]
             if "carving_loss" in metrics_dict:
