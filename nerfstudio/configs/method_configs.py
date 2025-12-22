@@ -436,7 +436,7 @@ method_configs["neurad"] = TrainerConfig(
         },
 
     },
-    gradient_accumulation_steps={"camera_opt": 100},
+    # gradient_accumulation_steps={"camera_opt_trans": 100, "camera_opt_rot": 100},
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis= "viewer+tensorboard",
     logging=LoggingConfig(steps_per_log=100),
