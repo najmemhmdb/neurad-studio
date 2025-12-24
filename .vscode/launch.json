@@ -41,7 +41,7 @@
         // "--load-step=14000",
         // "--training_start_step=14000",
         // "--max_num_iterations=5000",
-        // "--steps-per-eval-batch=10000"و
+        // "--steps-per-eval-batch=10000",
         // "--steps-per-eval-all-images=10000"
         "--pipeline.model.eval_num_rays_per_chunk=2048",
         "--pipeline.datamanager.num_processes=0",
