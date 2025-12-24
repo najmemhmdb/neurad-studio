@@ -49,6 +49,8 @@ from nerfstudio.utils.writer import EventName, TimeWriter
 from nerfstudio.viewer.viewer import Viewer as ViewerState
 from nerfstudio.viewer_legacy.server.viewer_state import ViewerLegacyState
 import copy
+import gc, torch
+
 TRAIN_INTERATION_OUTPUT = Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
 TORCH_DEVICE = str
 
@@ -141,12 +143,13 @@ class TrainerConfig(ExperimentConfig):
     """Optionally log gradients during training"""
     gradient_accumulation_steps: Dict[str, int] = field(default_factory=lambda: {})
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
-    reset_at_steps: List[int] = field(default_factory=lambda: [0, 10, 20])   # set None to disable resetting
+    reset_at_steps: List[int] = field(default_factory=lambda: [0, 2000, 4000, 6000, 8000])   # set None to disable resetting
     """Optionally specify the step to reset the model and optimizer states."""
-    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [0.35, 0.5, 1.0])
+    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0])
     """Optionally specify the camera resolution scale factor to use at the reset steps."""
     _reset_exclude_key_substrings: List[str] = field(default_factory=lambda: ["camera_optimizer."])
     """Optionally specify the key substrings to exclude from the reset."""
+
 
 class Trainer:
     """Trainer class
@@ -206,26 +209,67 @@ class Trainer:
 
     def _recursive_to_cpu(self, obj):
         """Move tensors in (nested) containers to CPU so the snapshot doesn't double VRAM."""
+        # Move to CPU with explicit cleanup
+    def move_to_cpu(self, obj):
         if torch.is_tensor(obj):
-            return obj.detach().cpu()
-        if isinstance(obj, dict):
-            return {k: self._recursive_to_cpu(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._recursive_to_cpu(v) for v in obj]
-        if isinstance(obj, tuple):
-            return tuple(self._recursive_to_cpu(v) for v in obj)
-        return copy.deepcopy(obj)
+            # Use .cpu() with non_blocking for async transfer
+            cpu_tensor = obj.detach().cpu()
+            # Make sure transfer is complete
+            if obj.is_cuda:
+                torch.cuda.synchronize()
+            # Clean up original tensor if it's on GPU
+            if obj.is_cuda:
+                del obj
+            return cpu_tensor
+        elif isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                result[k] = self.move_to_cpu(v)
+
+            del obj 
+            return result
+        elif isinstance(obj, list):
+            result = []
+            for i, v in enumerate(obj):
+                result.append(self.move_to_cpu(v))
+                obj[i] = None  # Clear reference
+            return result
+        elif isinstance(obj, tuple):
+            result = tuple(self.move_to_cpu(v) for v in obj)
+            # Can't modify tuple in place, but we can clear references
+            for i in range(len(obj)):
+                if isinstance(obj[i], torch.Tensor) and obj[i].is_cuda:
+                    del obj[i]
+            return result
+        else:
+            return obj
 
     def _capture_reset_snapshot(self) -> Dict[str, object]:
-        # pipeline weights
+        """Move tensors in (nested) containers to CPU for snapshot."""
+        # Clear any cached memory before taking snapshot
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        
+        # Get pipeline state dict
         pipe_sd = self.pipeline.module.state_dict() if hasattr(self.pipeline, "module") else self.pipeline.state_dict()
-
+        
+        # Create snapshot with minimal copying
         snap = {
-            "pipeline": self._recursive_to_cpu(pipe_sd),
-            "optimizers": {k: self._recursive_to_cpu(opt.state_dict()) for k, opt in self.optimizers.optimizers.items()},
-            "schedulers": {k: self._recursive_to_cpu(sch.state_dict()) for k, sch in self.optimizers.schedulers.items()},
-            "scaler": self._recursive_to_cpu(self.grad_scaler.state_dict()),
+            "pipeline": self.move_to_cpu(pipe_sd),
+            "optimizers": {k: self.move_to_cpu(opt.state_dict()) for k, opt in self.optimizers.optimizers.items()},
+            "schedulers": {k: self.move_to_cpu(sch.state_dict()) for k, sch in self.optimizers.schedulers.items()},
+            "scaler": self.move_to_cpu(self.grad_scaler.state_dict()),
         }
+        
+        # Clear the original containers to free memory
+        del pipe_sd
+        # Clear cache after snapshot
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.empty_cache()
+        
         return snap
     
 
@@ -236,7 +280,14 @@ class Trainer:
                 if torch.is_tensor(v):
                     state[k] = v.to(dev)
     
+    
     def _reset_model_weights_except(self) -> None:
+        """Reset model weights from snapshot, excluding specified keys."""
+        # Clear cache before reset
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.empty_cache()
+        
         snap_sd = self._reset_snapshot["pipeline"]  # CPU snapshot
         cur_sd = self.pipeline.module.state_dict() if hasattr(self.pipeline, "module") else self.pipeline.state_dict()
 
@@ -245,37 +296,60 @@ class Trainer:
                 continue  # keep current (camera) params
             cur_sd[k] = v  # restore everything else
 
+        del snap_sd
+        gc.collect()
+        torch.cuda.empty_cache()
         if hasattr(self.pipeline, "module"):
             self.pipeline.module.load_state_dict(cur_sd, strict=True)
         else:
             self.pipeline.load_state_dict(cur_sd, strict=True)
 
-    
-    def _reset_model_and_optimizers(self) -> None:
-        
-        self._reset_model_weights_except()
-        snap = self._reset_snapshot
+        # Clean up
+        del cur_sd
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        # Reset optimizers + schedulers
+
+    def _reset_model_and_optimizers(self) -> None:
+        """Reset model and optimizers to initial snapshot state."""
+
+        # 1) Drop old objects
+        del self.optimizers
+
+        # If you kept extra references elsewhere, clear those too.
+
+        # 2) Force Python to collect old CPU objects
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Reset model weights (excluding camera optimizer params)
+        self._reset_model_weights_except()
+
+        # Reinit optimizers
+        self.optimizers = self.setup_optimizers()
+        
+        # Load snapshot states into the NEW objects
         for k, opt in self.optimizers.optimizers.items():
-            opt.load_state_dict(copy.deepcopy(snap["optimizers"][k]))
+            opt.load_state_dict(copy.deepcopy(self._reset_snapshot["optimizers"][k]))
             self._move_optimizer_state_to_device(opt, self.device)
 
         for k, sch in self.optimizers.schedulers.items():
-            sch.load_state_dict(copy.deepcopy(snap["schedulers"][k]))
+            sch.load_state_dict(copy.deepcopy(self._reset_snapshot["schedulers"][k]))
 
         # Reset grad scaler
-        self.grad_scaler.load_state_dict(copy.deepcopy(snap["scaler"]))
+        self.grad_scaler.load_state_dict(copy.deepcopy(self._reset_snapshot["scaler"]))
+
 
         # Clear any leftover grads
         for opt in self.optimizers.optimizers.values():
             opt.zero_grad(set_to_none=True)
 
-        # Reset trackers so early stopping / “best” checkpoint logic doesn’t get confused
+        # Reset trackers
         self.early_stopping_tracker.best = None
         self.early_stopping_tracker.latest = None
         self.checkpoint_saving_tracker.best = None
         self.checkpoint_saving_tracker.latest = None
+            
     
     def setup(self, test_mode: Literal["test", "val", "inference"] = "val") -> None:
         """Setup the Trainer by calling other setup functions.
@@ -294,7 +368,6 @@ class Trainer:
             grad_scaler=self.grad_scaler,
         )
         self.optimizers = self.setup_optimizers()
-        print(self.config.load_dir)
         self._load_checkpoint()  # load checkpoint before setting up optimizers in case parameters are re-registered
         
 
@@ -356,7 +429,6 @@ class Trainer:
 
     def setup_optimizers(self) -> Optimizers:
         """Helper to set up the optimizers
-
         Returns:
             The optimizers object given the trainer config.
         """
@@ -383,25 +455,59 @@ class Trainer:
 
                 while self.training_state == "paused":
                     time.sleep(0.01)
-
+                
                 if self.config.reset_at_steps is not None and step in self.config.reset_at_steps:
-                    with self.train_lock:  # important (viewer/eval might access the pipeline)
+                     with self.train_lock:  # important (viewer/eval might access the pipeline)
                         CONSOLE.log(f"[yellow]Resetting model+optimizer states at step {step}[/yellow]")
+                        
+                        # Switch to eval mode to reduce memory usage
+                        was_training = self.pipeline.training
+                        self.pipeline.eval()
+                        
+                        # Clear all gradients and cache before reset
+                        for opt in self.optimizers.optimizers.values():
+                            opt.zero_grad(set_to_none=True)
+                        
+                        # Force Python garbage collection
+                        gc.collect()
+                        
+                        # Clear CUDA cache with synchronization
+                        if "cuda" in self.device:
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        
+                        # Perform reset
                         self._reset_model_and_optimizers()
-                        self.pipeline.datamanager.update_dataset_resolution(self.config.camera_res_scale_factor_at_reset[self.config.reset_at_steps.index(step)])
+                        
+                        # Clear memory after reset
+                        gc.collect()
+                        if "cuda" in self.device:
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        
+                        # Switch back to train mode if it was training
+                        if was_training:
+                            self.pipeline.train()
+                            time.sleep(2)
+                        
+                        # Skip one iteration to allow memory to stabilize
+                        continue
+                        
+                        # self.pipeline.datamanager.update_dataset_resolution(self.config.camera_res_scale_factor_at_reset[self.config.reset_at_steps.index(step)])
                 with self.train_lock:
                     with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
+                        
                         self.pipeline.train()
-
+                        
                         # training callbacks before the training iteration
                         for callback in self.callbacks:
                             callback.run_callback_at_location(
                                 step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION
                             )
-
+                        
                         # time the forward pass
                         loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.train_iteration(step)
-
+                        
                         # training callbacks after the training iteration
                         for callback in self.callbacks:
                             callback.run_callback_at_location(
@@ -421,8 +527,8 @@ class Trainer:
 
                 self._update_viewer_state(step)
                 for i in range(len(camera_xyz)):
-                    writer.record_xyz(name=f"Camera Position {i}", xyz=camera_xyz[i], step=step)
-                    writer.record_xyz(name=f"train/xyz_gt {i}", xyz=camera_xyz_gt[i], step=step)
+                    writer.record_xyz(name=f"Camera Position {i}", xyz=camera_xyz[i].detach().cpu(), step=step)
+                    writer.record_xyz(name=f"train/xyz_gt {i}", xyz=camera_xyz_gt[i].detach().cpu(), step=step)
                     diff = (camera_xyz[i].detach().cpu() - camera_xyz_gt[i].detach().cpu())
                     writer.put_scalar(name=f"train/xyz_l2_error {i}", scalar=float(diff.norm().cpu()), step=step)
                 # a batch of train rays
@@ -646,6 +752,11 @@ class Trainer:
         Args:
             step: Current training step.
         """
+        
+        # Clear cache before starting iteration
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.empty_cache()
 
         needs_zero = [
             group for group in self.optimizers.parameters.keys() if step % self.gradient_accumulation_steps[group] == 0
@@ -654,23 +765,35 @@ class Trainer:
         cpu_or_cuda_str: str = self.device.split(":")[0]
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
 
-        with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
-            _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
-            loss = functools.reduce(torch.add, loss_dict.values())
-        # grad_norm_per_term(loss_dict, self.pipeline.model.parameters(), every=1, step=step, log_file=str(self.base_dir / "grad_norms.csv"), rank=getattr(self, "local_rank", 0))
-        torch.autograd.set_detect_anomaly(True)
-        # scale = self.grad_scaler.get_scale()
-        # with open(str(self.base_dir / "scaler.csv"), "a", buffering=1) as f:
-        #     f.write(f"{step},{scale}\n")
-
-        if not torch.isfinite(loss):
-            print("Non-finite loss!", loss)
-            for k, v in loss_dict.items():
-                if not torch.isfinite(v).all():
-                    print("Bad loss term:", k, v)
-            raise RuntimeError("loss became non-finite")
+        try:
+            with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+                _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
+                loss = functools.reduce(torch.add, loss_dict.values())
             
-        self.grad_scaler.scale(loss).backward()  # type: ignore
+            if not torch.isfinite(loss):
+                print("Non-finite loss!", loss)
+                for k, v in loss_dict.items():
+                    if not torch.isfinite(v).all():
+                        print("Bad loss term:", k, v)
+                raise RuntimeError("loss became non-finite")
+            
+            # Clean intermediate tensors before backward pass
+            self.grad_scaler.scale(loss).backward()  # type: ignore
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"OOM at step {step}. Clearing cache...")
+                # Clear gradients
+                for opt in self.optimizers.optimizers.values():
+                    opt.zero_grad(set_to_none=True)
+                # Clear cache
+                gc.collect()
+                if "cuda" in self.device:
+                    torch.cuda.empty_cache()
+                # Return dummy values to continue training
+                return torch.tensor(0.0), {}, {}, [], []
+            raise
+        
         needs_step = [
             group
             for group in self.optimizers.parameters.keys()
@@ -694,6 +817,21 @@ class Trainer:
         # If the gradient scaler is decreased, no optimization step is performed so we should not step the scheduler.
         if scale <= self.grad_scaler.get_scale():
             self.optimizers.scheduler_step_all(step)
+        
+        # Clean up loss dict tensors that are no longer needed
+        for k in list(loss_dict.keys()):
+            if torch.is_tensor(loss_dict[k]):
+                loss_dict[k] = loss_dict[k].detach().cpu()
+        
+        # Clean up metrics dict tensors
+        for k in list(metrics_dict.keys()):
+            if torch.is_tensor(metrics_dict[k]):
+                metrics_dict[k] = metrics_dict[k].detach().cpu()
+
+        # Clear cache after iteration
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.empty_cache()
 
         # Merging loss and metrics dict into a single output.
         return loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt  # type: ignore
