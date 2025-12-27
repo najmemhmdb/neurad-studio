@@ -527,8 +527,8 @@ class Trainer:
 
                 self._update_viewer_state(step)
                 for i in range(len(camera_xyz)):
-                    writer.record_xyz(name=f"Camera Position {i}", xyz=camera_xyz[i].detach().cpu(), step=step)
-                    writer.record_xyz(name=f"train/xyz_gt {i}", xyz=camera_xyz_gt[i].detach().cpu(), step=step)
+                    writer.record_xyz(name=f"Camera Position {i}", xyz=camera_xyz[i], step=step)
+                    writer.record_xyz(name=f"train/xyz_gt {i}", xyz=camera_xyz_gt[i], step=step)
                     diff = (camera_xyz[i].detach().cpu() - camera_xyz_gt[i].detach().cpu())
                     writer.put_scalar(name=f"train/xyz_l2_error {i}", scalar=float(diff.norm().cpu()), step=step)
                 # a batch of train rays
@@ -754,9 +754,9 @@ class Trainer:
         """
         
         # Clear cache before starting iteration
-        gc.collect()
-        if "cuda" in self.device:
-            torch.cuda.empty_cache()
+        # gc.collect()
+        # if "cuda" in self.device:
+        #     torch.cuda.empty_cache()
 
         needs_zero = [
             group for group in self.optimizers.parameters.keys() if step % self.gradient_accumulation_steps[group] == 0
@@ -765,34 +765,34 @@ class Trainer:
         cpu_or_cuda_str: str = self.device.split(":")[0]
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
 
-        try:
-            with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
-                _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
-                loss = functools.reduce(torch.add, loss_dict.values())
+        # try:
+        with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+            _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
+            loss = functools.reduce(torch.add, loss_dict.values())
             
-            if not torch.isfinite(loss):
-                print("Non-finite loss!", loss)
-                for k, v in loss_dict.items():
-                    if not torch.isfinite(v).all():
-                        print("Bad loss term:", k, v)
-                raise RuntimeError("loss became non-finite")
+            # if not torch.isfinite(loss):
+            #     print("Non-finite loss!", loss)
+            #     for k, v in loss_dict.items():
+            #         if not torch.isfinite(v).all():
+            #             print("Bad loss term:", k, v)
+            #     raise RuntimeError("loss became non-finite")
             
-            # Clean intermediate tensors before backward pass
-            self.grad_scaler.scale(loss).backward()  # type: ignore
+        # Clean intermediate tensors before backward pass
+        self.grad_scaler.scale(loss).backward()  # type: ignore
             
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"OOM at step {step}. Clearing cache...")
-                # Clear gradients
-                for opt in self.optimizers.optimizers.values():
-                    opt.zero_grad(set_to_none=True)
-                # Clear cache
-                gc.collect()
-                if "cuda" in self.device:
-                    torch.cuda.empty_cache()
-                # Return dummy values to continue training
-                return torch.tensor(0.0), {}, {}, [], []
-            raise
+        # except RuntimeError as e:
+        #     if "out of memory" in str(e).lower():
+        #         print(f"OOM at step {step}. Clearing cache...")
+        #         # Clear gradients
+        #         for opt in self.optimizers.optimizers.values():
+        #             opt.zero_grad(set_to_none=True)
+        #         # Clear cache
+        #         gc.collect()
+        #         if "cuda" in self.device:
+        #             torch.cuda.empty_cache()
+        #         # Return dummy values to continue training
+        #         return torch.tensor(0.0), {}, {}, [], []
+        #     raise
         
         needs_step = [
             group
@@ -818,20 +818,20 @@ class Trainer:
         if scale <= self.grad_scaler.get_scale():
             self.optimizers.scheduler_step_all(step)
         
-        # Clean up loss dict tensors that are no longer needed
-        for k in list(loss_dict.keys()):
-            if torch.is_tensor(loss_dict[k]):
-                loss_dict[k] = loss_dict[k].detach().cpu()
+        # # Clean up loss dict tensors that are no longer needed
+        # for k in list(loss_dict.keys()):
+        #     if torch.is_tensor(loss_dict[k]):
+        #         loss_dict[k] = loss_dict[k].detach().cpu()
         
-        # Clean up metrics dict tensors
-        for k in list(metrics_dict.keys()):
-            if torch.is_tensor(metrics_dict[k]):
-                metrics_dict[k] = metrics_dict[k].detach().cpu()
+        # # Clean up metrics dict tensors
+        # for k in list(metrics_dict.keys()):
+        #     if torch.is_tensor(metrics_dict[k]):
+        #         metrics_dict[k] = metrics_dict[k].detach().cpu()
 
-        # Clear cache after iteration
-        gc.collect()
-        if "cuda" in self.device:
-            torch.cuda.empty_cache()
+        # # Clear cache after iteration
+        # gc.collect()
+        # if "cuda" in self.device:
+        #     torch.cuda.empty_cache()
 
         # Merging loss and metrics dict into a single output.
         return loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt  # type: ignore
