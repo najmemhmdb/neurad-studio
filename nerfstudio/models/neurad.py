@@ -59,11 +59,8 @@ from nerfstudio.utils.math import chamfer_distance
 from nerfstudio.utils.printing import print_tcnn_speed_warning
 from nerfstudio.viewer.server.viewer_elements import ViewerSlider
 import torch
-import kornia as K
-import kornia.filters as KF
-import kornia.color as KC
-import kornia.morphology as KM
-
+import torch.nn as nn
+import torch.nn.functional as F
 
 EPS = 1e-7
 
@@ -98,6 +95,12 @@ class LossSettings:
     """Multiplier for the ray drop loss."""
     prop_lidar_loss_mult: float = 0.1
     """Multiplier for the proposal depth loss (on top of existing multiplier)."""
+    edge_mult: float = 1.0
+    """Multiplier for the edge loss."""
+    edge_mult_v: float = 1.0
+    """Multiplier for the edge loss vertical."""
+    edge_mult_h: float = 1.0
+    """Multiplier for the edge loss horizontal."""
 
 
 @dataclass
@@ -277,6 +280,8 @@ class NeuRADModel(ADModel):
         self.rmse = lambda pred, gt: torch.sqrt(torch.mean((pred - gt) ** 2))
         self.chamfer_distance = lambda pred, gt: chamfer_distance(pred, gt, 1_000, True)
         self.step = 0
+        # self.sobel_weight = SobelEdges()
+        # self.gauss = GaussianBlurDepthwise(ksize=11, sigma=2.0)
 
     @property
     def fields(self) -> list[Union[NeuRADField, NeuRADProposalField]]:
@@ -502,14 +507,8 @@ class NeuRADModel(ADModel):
                 unreduced_depth_loss[~did_return] *= self.config.loss.non_return_loss_mult
                 # TODO: get rid of quantile mask
                 quantile = torch.quantile(unreduced_depth_loss, self.config.loss.quantile_threshold)
-                # quantile = torch.quantile(unreduced_depth_loss.float(), self.config.loss.quantile_threshold)
                 quantile_mask = (unreduced_depth_loss < quantile).squeeze(-1)
-                # quantile_mask = (unreduced_depth_loss <= quantile).squeeze(-1)
                 metrics_dict["depth_loss"] = torch.mean(unreduced_depth_loss[quantile_mask])
-                # masked = unreduced_depth_loss[quantile_mask]
-                # if masked.numel() == 0:
-                    # masked = unreduced_depth_loss  # fallback
-                # metrics_dict["depth_loss"] = masked.mean()
                 quant_and_return = quantile_mask & did_return
                 metrics_dict["intensity_loss"] = self.intensity_loss(
                     points_intensities[quant_and_return], outputs["intensity"][quant_and_return]
@@ -545,14 +544,16 @@ class NeuRADModel(ADModel):
         loss_dict = {}
         if "image" in batch:
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
-            # edges = self.edge_aware_blur(image.permute(0, 3, 1, 2), canny_low=0.1, canny_high=0.2, blur_ksize=3, blur_sigma=1.0, dilate_ksize=3)
-            # rgb_weighted = rgb * edges.permute(0, 2, 3, 1)
-            # image_weighted = image * edges.permute(0, 2, 3, 1)
-            # loss_dict["rgb_edge_aware_loss"] = self.rgb_loss(image_weighted, rgb_weighted) * conf.rgb_mult * 50
-            # loss_dict["rgb_edge_aware_loss"] = torch.mean(self.edge_aware_rgb_loss(image, rgb) * edges.permute(0, 2, 3, 1)) * conf.rgb_mult * 50
             loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult 
             if conf.vgg_mult > 0.0:
                 loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
+            # if conf.edge_mult > 0.0:
+            #     loss, lv, lh, _, _= self.edge_weighted_charbonnier_vh_fast(rgb.permute(0,3,1,2).contiguous(),
+            #                                                          image.permute(0,3,1,2).contiguous().to(self.device),
+            #                                                          coef_v=conf.edge_mult_v, coef_h=conf.edge_mult_h, return_parts=True)
+            #     loss_dict["edge_loss"] = loss * conf.edge_mult
+            #     loss_dict["edge_loss_vertical"] = lv * conf.edge_mult_v
+            #     loss_dict["edge_loss_horizontal"] = lh * conf.edge_mult_h
         if self.training:
             if "weights_list" in outputs:
                 loss_dict["interlevel_loss"] = self.config.loss.interlevel_loss_mult * self.interlevel_loss(
@@ -577,6 +578,8 @@ class NeuRADModel(ADModel):
             self.camera_optimizer.get_loss_dict(loss_dict)
         return loss_dict
 
+    
+
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
@@ -586,6 +589,11 @@ class NeuRADModel(ADModel):
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
             images_dict["img"] = torch.cat([image, rgb], dim=1)
             images_dict["depth"] = colormaps.apply_depth_colormap(outputs["depth"])
+            # loss, lv, lh, wv, wh = self.edge_weighted_charbonnier_vh_fast(outputs["rgb"].permute(2,0,1).unsqueeze(0).contiguous(),
+            #                                                          batch["image"].permute(2,0,1).to(self.device).unsqueeze(0).contiguous(),
+            #                                                          coef_v=2.0, coef_h=1.0, return_parts=True)
+            # images_dict["edge"] = torch.cat([wv.squeeze(0).permute(1,2,0), wh.squeeze(0).permute(1,2,0)], dim=1)
+
             if self.config.verbose:
                 images_dict["accumulation"] = colormaps.apply_colormap(outputs["accumulation"])
                 # Add proposal depthmaps
@@ -636,46 +644,7 @@ class NeuRADModel(ADModel):
             else:
                 metrics_dict["chamfer_distance"] = points[did_return, :3].norm(dim=-1).mean()
         return metrics_dict, images_dict
-    # @torch.no_grad()  # remove if you need grads
-    def edge_aware_blur(self,
-        x: torch.Tensor,
-        canny_low: float = 0.1,
-        canny_high: float = 0.2,
-        blur_ksize: int = 7,
-        blur_sigma: float = 2.0,
-        dilate_ksize: int = 3,   # set <=1 to skip dilation
-    ):
-        assert x.ndim == 4, "x must be [B, C, H, W]"
-        device, dtype_in = x.device, x.dtype
-
-        # normalize to [0,1] float for Kornia ops
-        img = x.clamp(0, 1) if x.dtype.is_floating_point else x.float().clamp(0, 255) / 255.0
-
-        # grayscale for edge detection
-        gray = KC.rgb_to_grayscale(img) if img.size(1) == 3 else img
-
-        # edges via Canny
-        canny = KF.Canny(low_threshold=canny_low, high_threshold=canny_high)
-        edges, _ = canny(gray)  # [B,1,H,W] in [0,1]
-
-        # optional dilation to thicken the mask
-        if dilate_ksize and dilate_ksize > 1:
-            kernel = torch.ones(dilate_ksize, dilate_ksize, device=device, dtype=img.dtype)  # <-- 2D kernel
-            edges = KM.dilation(edges, kernel)
-
-        # mask = (edges > 0.5).to(img.dtype)  # [B,1,H,W]
-
-        # # blur whole image, then mix only on edges
-        # blurred = KF.gaussian_blur2d(img, (blur_ksize, blur_ksize), (blur_sigma, blur_sigma))
-        # out = img * (1 - mask) + blurred * mask
-
-        # return in original dtype/range
-        if not dtype_in.is_floating_point:
-            out = (edges * 255.0).round().clamp(0, 255).to(dtype_in)
-        else:
-            out = edges.to(dtype_in)
-        return out
-
+ 
     @torch.no_grad()
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
         """Takes in camera parameters and computes the output of the model.
@@ -779,6 +748,112 @@ class NeuRADModel(ADModel):
                 sigmas=value,
             )
         return weights
+    
+
+    def edge_weighted_charbonnier_vh_fast(self,
+        rgb: torch.Tensor,  # [B,3,H,W] in [0,1]
+        gt_rgb: torch.Tensor,    # [B,3,H,W] in [0,1]
+        *,
+        coef_v: float = 1.0,
+        coef_h: float = 1.0,
+        eps_charb: float = 1e-3,
+        w_min: float = 1e-2,
+        w_max: float = 1.0,
+        edge_power: float = 2.0,
+        blur_ksize: int = 11,
+        blur_sigma: float = 2.0,
+        stable_norm_fp32: bool = True,   # recommended if training with AMP
+        return_parts: bool = False
+    ):
+        device, dtype = gt_rgb.device, gt_rgb.dtype
+
+        # luminance (GT only) -> [B,1,H,W]
+        # (creates one tensor; everything else reuses/overwrites)
+        y = gt_rgb[:, 0:1].mul(0.2989).add(gt_rgb[:, 1:2].mul(0.5870)).add(gt_rgb[:, 2:3].mul(0.1140))
+
+        # Sobel in one conv: output [B,2,H,W] where [:,0]=gx, [:,1]=gy
+        self.sobel_weight.to(device)
+        self.gauss.to(device)
+        g = self.sobel_weight(y)   # [B,2,H,W]
+        g.abs_()                               # now holds ev, eh
+
+        # Gaussian blur both channels together (depthwise conv for speed)
+        if blur_ksize > 1:
+            g = self.gauss(g)   # [B,2,H,W]
+
+        # Normalize per channel to [0,1] (in-place)
+        _norm01_inplace(g, stable_fp32=stable_norm_fp32)
+        g.clamp_(0, 1)
+
+        # Build weights (in-place-ish)
+        # g[:,0:1]=ev_n, g[:,1:2]=eh_n
+        ev_n = g[:, 0:1]
+        eh_n = g[:, 1:2]
+
+        # w = w_min + (w_max-w_min) * (edge**edge_power)
+        scale = (w_max - w_min)
+
+        wv = ev_n.pow(edge_power).mul(scale).add(w_min)  # [B,1,H,W]
+        wh = eh_n.pow(edge_power).mul(scale).add(w_min)
+
+        # losses
+        loss_v = _weighted_charbonnier_rgb(rgb, gt_rgb, wv, eps_charb=eps_charb)
+        loss_h = _weighted_charbonnier_rgb(rgb, gt_rgb, wh, eps_charb=eps_charb)
+        loss = coef_v * loss_v + coef_h * loss_h
+
+        if return_parts:
+            return loss, loss_v, loss_h, wv, wh
+        return loss
+
+
+class SobelEdges(nn.Module):
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[-1, 0, 1],
+                           [-2, 0, 2],
+                           [-1, 0, 1]], dtype=torch.float32) / 8.0
+        ky = torch.tensor([[-1,-2,-1],
+                           [ 0, 0, 0],
+                           [ 1, 2, 1]], dtype=torch.float32) / 8.0
+        w = torch.stack([kx, ky], dim=0).unsqueeze(1)  # [2,1,3,3]
+        self.register_buffer("sobel_w", w)  # not a parameter, but moves with .to()
+
+    def forward(self, y):  # y: [B,1,H,W]
+        w = self.sobel_w.to(dtype=y.dtype)  # cheap cast if needed (or keep fp32)
+        g = F.conv2d(y, w, padding=1)
+        return g
+
+class GaussianBlurDepthwise(nn.Module):
+    """
+    Depthwise Gaussian blur for NCHW tensors.
+    - Expects x: [B,C,H,W]
+    - Applies same Gaussian kernel per channel using groups=C.
+    """
+    def __init__(self, ksize: int = 11, sigma: float = 5.0):
+        super().__init__()
+        assert ksize % 2 == 1, "ksize must be odd"
+        self.ksize = int(ksize)
+        self.sigma = float(sigma)
+
+        # create kernel once in float32 on CPU
+        ax = torch.arange(self.ksize, dtype=torch.float32) - (self.ksize - 1) / 2
+        g = torch.exp(-(ax * ax) / (2 * self.sigma * self.sigma))
+        g = g / g.sum()
+        k2d = torch.outer(g, g)
+        k2d = k2d / k2d.sum()  # [ksize, ksize]
+
+        # store as [1,1,ksize,ksize]; we will expand at runtime to [C,1,ksize,ksize]
+        self.register_buffer("k2d", k2d.view(1, 1, self.ksize, self.ksize))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,C,H,W]
+        B, C, H, W = x.shape
+
+        # make kernel match x device/dtype and expand for depthwise conv
+        w = self.k2d.to(device=x.device, dtype=x.dtype).expand(C, 1, self.ksize, self.ksize)
+
+        pad = self.ksize // 2
+        return F.conv2d(x, w, padding=pad, groups=C)
 
 
 def render_depth_simple(
@@ -791,8 +866,28 @@ def render_depth_simple(
     return nerfacc.accumulate_along_rays(weights[..., 0], values=steps, ray_indices=ray_indices, n_rays=num_rays)
 
 
-def multiplier(step, start=1.0, final=0.1, hold=4000, tau=8000):
-    if step <= hold:
-        return start
-    t = step - hold
-    return final + (start - final) * math.exp(-t / tau)
+
+def _norm01_inplace(x, eps=1e-12, stable_fp32=False):
+    """
+    x: [B,C,H,W] modified in-place to (x-min)/(max-min+eps), per (B,C).
+    If stable_fp32=True, min/max computed in fp32 (helpful under AMP).
+    """
+    if stable_fp32 and x.dtype in (torch.float16, torch.bfloat16):
+        x32 = x.float()
+        x_min = x32.amin(dim=(2,3), keepdim=True).to(x.dtype)
+        x_max = x32.amax(dim=(2,3), keepdim=True).to(x.dtype)
+    else:
+        x_min = x.amin(dim=(2,3), keepdim=True)
+        x_max = x.amax(dim=(2,3), keepdim=True)
+
+    x.sub_(x_min)
+    x.div_(x_max.sub(x_min).add(eps))
+    return x
+
+def _weighted_charbonnier_rgb(pred, gt, w, eps_charb=1e-3, eps_den=1e-12):
+    # pred/gt: [B,3,H,W], w: [B,1,H,W] positive
+    diff = pred - gt
+    per_pix = torch.sqrt(diff * diff + eps_charb * eps_charb)  # [B,3,H,W]
+    num = (per_pix * w).sum(dim=(1,2,3))                       # [B]
+    denom = (w.sum(dim=(1,2,3)) * 3.0).clamp_min(eps_den)      # [B]
+    return (num / denom).mean()
