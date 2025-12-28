@@ -457,8 +457,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
     def load_init_extrinsics(self):
         l2s_dict = yaml.load(open(os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml"), "r"), Loader=yaml.FullLoader)
         sensors = ["front_camera", "front_left_camera", "front_right_camera", "back_camera","left_camera","right_camera"]
-        lidar2sensor_list_gt = []
-        lidar2sensor_list_noisy = []
+        sensor2lidar_list_gt = []
+        sensor2lidar_list_noisy = []
         
         def _skew(w):
             wx, wy, wz = w
@@ -529,18 +529,19 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             l2sensor["position"] = l2s["extrinsic"]["transform"]["translation"]
             l2sensor["heading"] = l2s["extrinsic"]["transform"]["rotation"]
             l2sensor_4x4 = _pandaset_pose_to_matrix(l2sensor)
-            lidar2sensor = torch.from_numpy(l2sensor_4x4[:3, :])
-            xi = mat4_to_SO3xR3_twist(lidar2sensor)
-            lidar2sensor_list_gt.append(xi)
+            sensor2l_4x4 = np.linalg.inv(l2sensor_4x4)
+            sensor2lidar = torch.from_numpy(sensor2l_4x4[:3, :])
+            xi = mat4_to_SO3xR3_twist(sensor2lidar)
+            sensor2lidar_list_gt.append(xi)
 
-            l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            # l2sensor_4x4_noisy[:3, 3]  -= ((0.02 * i) + 0.08)
-            l2sensor_4x4_noisy[:3, 3]  -= 0.15
-            lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
-            xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
-            lidar2sensor_list_noisy.append(xi_noisy)
+            sensor2l_4x4_noisy = sensor2l_4x4.copy()
+            # l2sensor_4x4_noisy[0, 3]  -= 2
+            sensor2l_4x4_noisy[:3, 3]  -= 0.3
+            sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy[:3, :])
+            xi_noisy = mat4_to_SO3xR3_twist(sensor2lidar_noisy)
+            sensor2lidar_list_noisy.append(xi_noisy)
            
-        return torch.stack(lidar2sensor_list_gt).to(dtype=torch.float32), torch.stack(lidar2sensor_list_noisy).to(dtype=torch.float32)
+        return torch.stack(sensor2lidar_list_gt).to(dtype=torch.float32), torch.stack(sensor2lidar_list_noisy).to(dtype=torch.float32)
 
     
     def forward(self, all_indices: Int[Tensor, "camera_indices"]) -> Float[Tensor, "camera_indices 3 4"]:
@@ -570,7 +571,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             # interpolated_batch_lidar2w = self.lidar2w[seq_indices]
             lidar2w_4x4 = pose_utils.to4x4(interpolated_batch_lidar2w)
 
-            sensor2w = lidar2w_4x4 @ torch.inverse(extrinsics_mapped)
+            sensor2w = lidar2w_4x4 @ extrinsics_mapped
             R = sensor2w[:, :3, :3]
             sensor2w[:, :3, :3] = R @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).cuda().to(dtype=torch.float32)
 
