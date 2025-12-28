@@ -38,7 +38,6 @@ from nerfstudio.data.dataparsers.ad_dataparser import (
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.utils.lidar_elevation_mappings import PANDAR64_ELEVATION_MAPPING
 from nerfstudio.utils import poses as pose_utils
-
 PANDASET_ELEVATION_MAPPING = {"Pandar64": PANDAR64_ELEVATION_MAPPING}
 
 LIDAR_NAME_TO_INDEX = {
@@ -159,11 +158,31 @@ class PandaSet(ADDataParser):
 
     def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray, idx: int) -> np.ndarray:
         """Add noise to the poses."""
-        
-        # extrinsic_l2cam[:3, 3] -= (0.08 + (0.02 * idx))
-        extrinsic_l2cam[:3, 3] -= 0.15
-        new_cam2w = l2w @ np.linalg.inv(extrinsic_l2cam)
+        extrinsic_cam2l = np.linalg.inv(extrinsic_l2cam)
+        # extrinsic_l2cam[2, 3] -= 0.5
+        extrinsic_cam2l[:3, 3] -= 0.3
+        new_cam2w = l2w @ extrinsic_cam2l
         return new_cam2w
+    
+    def _preload_lidars(self):
+        poses = []
+        times = []
+        for i in range(PANDASET_SEQ_LEN):
+            front_cam = self.sequence.camera["front_camera"]
+            front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
+            front_cam_extrinsics = self.extrinsics["front_camera"]
+            front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
+            front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
+            l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
+            l2w = torch.from_numpy(front_cam2w @ l2front_cam)
+            time = front_cam.timestamps[i]
+            for lidar in self.config.lidars:
+                poses.append(l2w)
+                times.append(time)
+        poses = torch.stack(poses)
+        times = torch.tensor(times, dtype=torch.float64) 
+
+        return poses, times
 
     def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
         """Returns camera info and image filenames."""
@@ -177,28 +196,21 @@ class PandaSet(ADDataParser):
         poses = []
         idxs = []
         heights = []
-            
-        front_cam_extrinsics = self.extrinsics["front_camera"]
-        front_cam_extrinsics["position"] = front_cam_extrinsics["extrinsic"]["transform"]["translation"]
-        front_cam_extrinsics["heading"] = front_cam_extrinsics["extrinsic"]["transform"]["rotation"]
-        l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)  
+        
+        l2ws, times = self._preload_lidars()
 
         for i in range(PANDASET_SEQ_LEN):
-            front_cam = self.sequence.camera["front_camera"]
-            front_cam2w = _pandaset_pose_to_matrix(front_cam.poses[i])
-            l2w = front_cam2w @ l2front_cam
-            
             for camera in cameras:
-
+                interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times, curr_cam.timestamps[i])
                 extrinsic_l2cam = self.extrinsics[camera]
                 extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
                 extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
                 l2cam = _pandaset_pose_to_matrix(extrinsic_l2cam) 
-
+                
                 curr_cam = self.sequence.camera[camera]
                 file_path = curr_cam._data_structure[i]
                 # pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
-                pose = self._add_noise(l2w, l2cam, cameras.index(camera))
+                pose = self._add_noise(interpolated_l2w, l2cam, cameras.index(camera))
                     
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
