@@ -245,37 +245,122 @@ def rotation_difference(rot1, rot2):
 
     return theta.unsqueeze(-1) * axis
 
-def vectorized_interpolate(poses, pose_times, query_times):
+# def vectorized_interpolate(poses, pose_times, query_times):
+#     """
+#     Interpolate SE(3) poses at arbitrary query_times.
+#     poses:      [N, 3, 4]   (world_T_lidar at pose_times)
+#     pose_times: [N, 1] or [N] (monotonic, same units as query_times)
+#     query_times:[B, 1] or [B]
+#     returns:    [B, 3, 4]
+#     """
+#     device = poses.device
+#     dtype  = poses.dtype
+
+#     # Ensure shapes
+#     pose_times  = pose_times.view(-1)
+#     query_times = query_times.view(-1)
+
+#     N = pose_times.shape[0]
+#     B = query_times.shape[0]
+
+#     # 1) find the index of the first pose time strictly greater than each query
+#     #    i1 in [0..N], clamp to [1..N-1] to ensure we have both neighbors
+#     i1 = torch.searchsorted(pose_times, query_times, right=False)
+#     i1 = torch.clamp(i1, 1, N - 1)
+#     i0 = i1 - 1
+
+#     t0 = pose_times[i0]
+#     t1 = pose_times[i1]
+#     # Avoid divide-by-zero if duplicate stamps
+#     denom = (t1 - t0).clamp_min(1e-9)
+#     alpha = ((query_times - t0) / denom).to(dtype)  # [B]
+    
+#     if alpha.item() == 0:
+#         return poses[i0][..., :3, :4]
+#     elif alpha.item() == 1:
+#         return poses[i1][..., :3, :4]
+#     else:
+#         # 2) gather neighbor poses
+#         P0 = poses[i0]  # [B,3,4]
+#         P1 = poses[i1]  # [B,3,4]
+
+#         R0 = P0[..., :3, :3]
+#         t0p = P0[..., :3, 3]
+#         R1 = P1[..., :3, :3]
+#         t1p = P1[..., :3, 3]
+
+#         # 3) rotation: SLERP
+#         q0 = rotmat_to_unitquat(R0)                 # [B,4]
+#         q1 = rotmat_to_unitquat(R1)                 # [B,4]
+#         q  = unitquat_slerp_fast(q0, q1, alpha)     # [B,4]
+#         R  = unitquat_to_rotmat(q)                  # [B,3,3]
+
+#         # 4) translation: linear in world frame
+#         t  = t0p + alpha.unsqueeze(-1) * (t1p - t0p)  # [B,3]
+#         # t  = t0p 
+#         out = torch.zeros(B, 3, 4, dtype=dtype, device=device)
+#         out[..., :3, :3] = R
+#         out[..., :3, 3]  = t
+#     return out
+
+
+def vectorized_interpolate(poses, pose_times, query_times, atol=0.0):
     """
-    Interpolate SE(3) poses at arbitrary query_times.
+    Interpolate/extrapolate SE(3) poses at arbitrary query_times.
+
     poses:      [N, 3, 4]   (world_T_lidar at pose_times)
-    pose_times: [N, 1] or [N] (monotonic, same units as query_times)
-    query_times:[B, 1] or [B]
+    pose_times: [N] or [N,1] (monotonic)
+    query_times:[B] or [B,1]
     returns:    [B, 3, 4]
     """
     device = poses.device
     dtype  = poses.dtype
 
-    # Ensure shapes
-    pose_times  = pose_times.view(-1)
-    query_times = query_times.view(-1)
+    pose_times  = pose_times.view(-1).to(device=device)
+    query_times = query_times.view(-1).to(device=device)
 
     N = pose_times.shape[0]
     B = query_times.shape[0]
+    assert N >= 2, "Need at least 2 poses for interpolation/extrapolation."
 
-    # 1) find the index of the first pose time strictly greater than each query
-    #    i1 in [0..N], clamp to [1..N-1] to ensure we have both neighbors
-    i1 = torch.searchsorted(pose_times, query_times, right=False)
-    i1 = torch.clamp(i1, 1, N - 1)
+    # idx = first index with pose_times[idx] >= query (insertion point)
+    idx = torch.searchsorted(pose_times, query_times, right=False)  # [B]
+
+    # --- exact-hit detection (optional tolerance) ---
+    idxc = idx.clamp(0, N - 1)
+    if atol == 0.0:
+        hit = (idx < N) & (pose_times[idxc] == query_times)
+    else:
+        hit = (idx < N) & torch.isclose(pose_times[idxc], query_times, rtol=0.0, atol=atol)
+
+    # --- choose segment endpoints (supports extrapolation) ---
+    i1 = idx.clone()
     i0 = i1 - 1
+
+    left  = (idx <= 0)   # query <= first stamp -> use [0,1]
+    right = (idx >= N)   # query  > last stamp  -> use [N-2,N-1]
+
+    i0[left]  = 0
+    i1[left]  = 1
+    i0[right] = N - 2
+    i1[right] = N - 1
+
+    interior = ~(left | right)
+    # interior idx is in [1..N-1] after clamping
+    i1[interior] = i1[interior].clamp(1, N - 1)
+    i0[interior] = i1[interior] - 1
 
     t0 = pose_times[i0]
     t1 = pose_times[i1]
-    # Avoid divide-by-zero if duplicate stamps
-    denom = (t1 - t0).clamp_min(1e-9)
-    alpha = ((query_times - t0) / denom).to(dtype)  # [B]
 
-    # 2) gather neighbor poses
+    # Avoid divide-by-zero (duplicates); this doesn't stop extrapolation
+    denom = (t1 - t0)
+    denom = torch.where(denom.abs() < 1e-9, torch.full_like(denom, 1e-9), denom)
+
+    alpha = (query_times - t0) / denom          # [B]  (NOT clamped => extrapolation)
+    alpha_f = alpha.float()                     # slerp usually happier in fp32
+
+    # Gather neighbor poses
     P0 = poses[i0]  # [B,3,4]
     P1 = poses[i1]  # [B,3,4]
 
@@ -284,16 +369,21 @@ def vectorized_interpolate(poses, pose_times, query_times):
     R1 = P1[..., :3, :3]
     t1p = P1[..., :3, 3]
 
-    # 3) rotation: SLERP
-    q0 = rotmat_to_unitquat(R0)                 # [B,4]
-    q1 = rotmat_to_unitquat(R1)                 # [B,4]
-    q  = unitquat_slerp_fast(q0, q1, alpha)     # [B,4]
-    R  = unitquat_to_rotmat(q)                  # [B,3,3]
+    # Rotation: SLERP
+    q0 = rotmat_to_unitquat(R0).float()                 # [B,4]
+    q1 = rotmat_to_unitquat(R1).float()                 # [B,4]
+    q  = unitquat_slerp_fast(q0, q1, alpha_f)           # [B,4]
+    R  = unitquat_to_rotmat(q).to(dtype)                # [B,3,3]
 
-    # 4) translation: linear in world frame
-    t  = t0p + alpha.unsqueeze(-1) * (t1p - t0p)  # [B,3]
-    # t  = t0p 
-    out = torch.zeros(B, 3, 4, dtype=dtype, device=device)
+    # Translation: linear (also fp32 for stability)
+    t = (t0p.float() + alpha_f.unsqueeze(-1) * (t1p.float() - t0p.float())).to(dtype)  # [B,3]
+
+    out = torch.empty(B, 3, 4, dtype=dtype, device=device)
     out[..., :3, :3] = R
     out[..., :3, 3]  = t
+
+    # Overwrite exact hits with stored pose (avoids SLERP endpoint weirdness)
+    if hit.any():
+        out[hit] = poses[idxc[hit]][..., :3, :4]
+
     return out
