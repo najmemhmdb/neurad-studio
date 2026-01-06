@@ -536,7 +536,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
             sensor2l_4x4_noisy = sensor2l_4x4.copy()
             # l2sensor_4x4_noisy[0, 3]  -= 2
-            sensor2l_4x4_noisy[:3, 3]  -= 0.3
+            sensor2l_4x4_noisy[:3, 3]  -= 0.15
             sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy[:3, :])
             xi_noisy = mat4_to_SO3xR3_twist(sensor2lidar_noisy)
             sensor2lidar_list_noisy.append(xi_noisy)
