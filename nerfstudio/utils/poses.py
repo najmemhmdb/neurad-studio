@@ -245,7 +245,6 @@ def rotation_difference(rot1, rot2):
 
     return theta.unsqueeze(-1) * axis
 
-
 def vectorized_interpolate(poses, pose_times, query_times, atol=0.0):
     """
     Interpolate/extrapolate SE(3) poses at arbitrary query_times.
@@ -260,7 +259,7 @@ def vectorized_interpolate(poses, pose_times, query_times, atol=0.0):
 
     pose_times  = pose_times.view(-1)
     query_times = query_times.view(-1)
-
+    
     N = pose_times.shape[0]
     B = query_times.shape[0]
     assert N >= 2, "Need at least 2 poses for interpolation/extrapolation."

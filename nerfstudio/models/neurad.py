@@ -471,11 +471,42 @@ class NeuRADModel(ADModel):
             self._compute_is_close_to_lidar(ray_samples, *prop_ray_samples)
         return ray_samples, prop_ray_samples, prop_weights
 
-    def get_metrics_dict(self, outputs, batch):
+    def get_metrics_dict(self, outputs, batch, model_gradient_mask=None, patch_size=None):
+        """Get metrics dictionary with optional gradient masking.
+        
+        Args:
+            outputs: Model outputs
+            batch: Batch dictionary
+            model_gradient_mask: Optional boolean mask [num_rays] where True means include in metrics.
+                            If None, all rays are included.
+            patch_size: Patch size used for sampling (e.g., 32 for 32x32 patches)
+                    Needed to map ray-level mask to patch-level masking for RGB.
+        """
         metrics_dict = {}
         if "image" in batch:
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
-            metrics_dict["psnr"] = self.psnr(rgb.detach(), image)
+            # metrics_dict["psnr"] = self.psnr(rgb.detach(), image)
+            # RGB has shape [num_patches, patch_scale*patch_size, patch_scale*patch_size, 3]
+            if model_gradient_mask is not None and patch_size is not None:
+                is_lidar = batch.get("is_lidar", torch.zeros(len(model_gradient_mask), 1, dtype=torch.bool, device=model_gradient_mask.device)).squeeze(-1)
+                camera_mask = ~is_lidar
+
+                if camera_mask.any():
+                    camera_ray_mask = model_gradient_mask[camera_mask]  
+                    B, P, _, _ = rgb.shape
+                    patch_scale = P // patch_size
+                    cemera_ray_mask_patch = camera_ray_mask.view(B, P, P) 
+                    cemera_ray_mask_patchscaled = cemera_ray_mask_patch.repeat_interleave(patch_scales, dim=1).repeat_interleave(spatch_scale, dim=2)
+                    masked_rgb = rgb[cemera_ray_mask_patchscaled]
+                    masked_image = image[cemera_ray_mask_patchscaled]
+                    metrics_dict["psnr"] = self.psnr(masked_rgb.detach(), masked_image)
+                
+                else:
+                    # No rays to compute PSNR
+                    metrics_dict["psnr"] = torch.tensor(0.0, device=rgb.device)
+            else:
+                metrics_dict["psnr"] = self.psnr(rgb.detach(), image)
+
         if "lidar" in batch:
             is_lidar = batch["is_lidar"][:, 0].to(self.device)
             n_lidar_rays = is_lidar.sum()
@@ -487,10 +518,27 @@ class NeuRADModel(ADModel):
             ray_drop_logits = outputs["ray_drop_logits"]
             pred_intensity = outputs["intensity"]
 
+             # Apply mask to lidar outputs if provided
+            if model_gradient_mask is not None:
+                lidar_mask = model_gradient_mask[is_lidar]
+                # Filter lidar outputs by mask
+                pred_depth = pred_depth[lidar_mask]
+                did_return = did_return[lidar_mask]
+                points_intensities = points_intensities[lidar_mask]
+                termination_depth = termination_depth[lidar_mask]
+                pred_intensity = pred_intensity[lidar_mask]
+                ray_drop_logits = ray_drop_logits[lidar_mask]
+                n_lidar_rays = lidar_mask.sum()
+
             # eval metrics
-            metrics_dict["depth_median_l2"] = self.median_l2(pred_depth[did_return], termination_depth[did_return])
-            metrics_dict["depth_mean_rel_l2"] = self.mean_rel_l2(pred_depth[did_return], termination_depth[did_return])
-            metrics_dict["intensity_rmse"] = self.rmse(pred_intensity[did_return], points_intensities[did_return])
+            if did_return.any():
+                metrics_dict["depth_median_l2"] = self.median_l2(pred_depth[did_return], termination_depth[did_return])
+                metrics_dict["depth_mean_rel_l2"] = self.mean_rel_l2(pred_depth[did_return], termination_depth[did_return])
+                metrics_dict["intensity_rmse"] = self.rmse(pred_intensity[did_return], points_intensities[did_return])
+            else:
+                metrics_dict["depth_median_l2"] = torch.tensor(0.0, device=pred_depth.device)
+                metrics_dict["depth_mean_rel_l2"] = torch.tensor(0.0, device=pred_depth.device)
+                metrics_dict["intensity_rmse"] = torch.tensor(0.0, device=pred_intensity.device)
             metrics_dict["ray_drop_accuracy"] = (
                 ((ray_drop_logits.sigmoid() > 0.5).squeeze(-1) == ~did_return).float().mean()
             )
@@ -531,23 +579,78 @@ class NeuRADModel(ADModel):
                     metrics_dict[f"depth_loss_{prop_i}"] = torch.mean(unreduced_depth_loss)
                     metrics_dict[f"carving_loss_{prop_i}"] = outputs[f"prop_weights_loss_{prop_i}"] / n_lidar_rays
 
+        # if self.training and "weights_list" in outputs:
+        #     metrics_dict["distortion"] = distortion_loss(outputs["weights_list"], outputs["ray_samples_list"])
         if self.training and "weights_list" in outputs:
-            metrics_dict["distortion"] = distortion_loss(outputs["weights_list"], outputs["ray_samples_list"])
+            # Apply mask to weights_list if provided
+            if model_gradient_mask is not None:
+                # Filter weights and ray_samples by mask
+                masked_weights_list = []
+                masked_ray_samples_list = []
+                for weights, ray_samples in zip(outputs["weights_list"], outputs["ray_samples_list"]):
+                    # weights shape: [num_rays, num_samples, ...]
+                    if len(weights.shape) >= 1 and weights.shape[0] == len(model_gradient_mask):
+                        masked_weights_list.append(weights[model_gradient_mask])
+                        masked_ray_samples_list.append(ray_samples[model_gradient_mask])
+                    else:
+                        masked_weights_list.append(weights)
+                        masked_ray_samples_list.append(ray_samples)
+                metrics_dict["distortion"] = distortion_loss(masked_weights_list, masked_ray_samples_list)
+            else:
+                metrics_dict["distortion"] = distortion_loss(outputs["weights_list"], outputs["ray_samples_list"])
 
         if self.config.field.use_sdf:
             metrics_dict["sdf_to_density"] = float(self.field.sdf_to_density.beta)
         self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
 
-    def get_loss_dict(self, outputs, batch, metrics_dict=None):
+    def get_loss_dict(self, outputs, batch, metrics_dict=None, model_gradient_mask=None, patch_size=None):
+        """Get loss dictionary with optional gradient masking.
+        
+        Args:
+            outputs: Model outputs
+            batch: Batch dictionary
+            metrics_dict: Metrics dictionary (should be computed with same mask if provided)
+            model_gradient_mask: Optional boolean mask [num_rays] where True means include in losses.
+            patch_size: Patch size used for sampling (needed for RGB masking).
+        """
         conf = self.config.loss
         loss_dict = {}
         if "image" in batch:
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
-            loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult 
-            if conf.vgg_mult > 0.0:
-                loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
-            # if conf.edge_mult > 0.0:
+
+            if model_gradient_mask is not None and patch_size is not None:
+                is_lidar = batch.get("is_lidar", torch.zeros(len(model_gradient_mask), 1, dtype=torch.bool, device=model_gradient_mask.device)).squeeze(-1)
+                camera_mask = ~is_lidar
+                if camera_mask.any():
+                    camera_ray_mask = model_gradient_mask[camera_mask]  
+                    B, P, _, _ = rgb.shape
+                    patch_scale = P // patch_size
+                    cemera_ray_mask_patch = camera_ray_mask.view(B, P, P) 
+                    cemera_ray_mask_patchscaled = cemera_ray_mask_patch.repeat_interleave(patch_scales, dim=1).repeat_interleave(spatch_scale, dim=2)
+                    masked_rgb = rgb[cemera_ray_mask_patchscaled]
+                    masked_image = image[cemera_ray_mask_patchscaled]
+                    loss_dict["rgb_loss"] = self.rgb_loss(masked_image, masked_rgb) * conf.rgb_mult
+                    if conf.vgg_mult > 0.0:
+                        loss_dict["vgg_loss"] = self.vgg_loss(masked_rgb, masked_image) * conf.vgg_mult
+                else:
+                    loss_dict["rgb_loss"] = torch.tensor(0.0, device=rgb.device)
+                    if conf.vgg_mult > 0.0:
+                        loss_dict["vgg_loss"] = torch.tensor(0.0, device=rgb.device)
+            else:
+                loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult
+                if conf.vgg_mult > 0.0:
+                    loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
+
+
+
+
+
+
+            # loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult 
+            # if conf.vgg_mult > 0.0:
+            #     loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
+            # # if conf.edge_mult > 0.0:
             #     loss, lv, lh, _, _= self.edge_weighted_charbonnier_vh_fast(rgb.permute(0,3,1,2).contiguous(),
             #                                                          image.permute(0,3,1,2).contiguous().to(self.device),
             #                                                          coef_v=conf.edge_mult_v, coef_h=conf.edge_mult_h, return_parts=True)
@@ -555,20 +658,51 @@ class NeuRADModel(ADModel):
             #     loss_dict["edge_loss_vertical"] = lv * conf.edge_mult_v
             #     loss_dict["edge_loss_horizontal"] = lh * conf.edge_mult_h
         if self.training:
+            # if "weights_list" in outputs:
+            #     loss_dict["interlevel_loss"] = self.config.loss.interlevel_loss_mult * self.interlevel_loss(
+            #         outputs["weights_list"], outputs["ray_samples_list"]
+            #     )
+            #     assert metrics_dict is not None and "distortion" in metrics_dict
+            #     loss_dict["distortion_loss"] = self.config.loss.distortion_loss_mult * metrics_dict["distortion"]
+            #     prop_depth_mult = conf.prop_lidar_loss_mult * conf.depth_mult
+            #     prop_carv_mult = conf.prop_lidar_loss_mult * conf.carving_mult
+            #     for i_prop in range(self.config.num_proposal_rounds):
+            #         loss_dict[f"depth_loss_{i_prop}"] =  prop_depth_mult * metrics_dict[f"depth_loss_{i_prop}"]
+            #         loss_dict[f"carving_loss_{i_prop}"] = prop_carv_mult * metrics_dict[f"carving_loss_{i_prop}"]
+
             if "weights_list" in outputs:
-                loss_dict["interlevel_loss"] = self.config.loss.interlevel_loss_mult * self.interlevel_loss(
-                    outputs["weights_list"], outputs["ray_samples_list"]
-                )
+                # Apply mask to weights_list if provided
+                if model_gradient_mask is not None:
+                    masked_weights_list = []
+                    masked_ray_samples_list = []
+                    for weights, ray_samples in zip(outputs["weights_list"], outputs["ray_samples_list"]):
+                        # weights shape: [num_rays, num_samples, ...]
+                        if len(weights.shape) >= 1 and weights.shape[0] == len(model_gradient_mask):
+                            masked_weights_list.append(weights[model_gradient_mask])
+                            masked_ray_samples_list.append(ray_samples[model_gradient_mask])
+                        else:
+                            masked_weights_list.append(weights)
+                            masked_ray_samples_list.append(ray_samples)
+                    loss_dict["interlevel_loss"] = self.config.loss.interlevel_loss_mult * self.interlevel_loss(
+                        masked_weights_list, masked_ray_samples_list
+                    )
+                else:
+                    loss_dict["interlevel_loss"] = self.config.loss.interlevel_loss_mult * self.interlevel_loss(
+                        outputs["weights_list"], outputs["ray_samples_list"]
+                    )
+                
                 assert metrics_dict is not None and "distortion" in metrics_dict
                 loss_dict["distortion_loss"] = self.config.loss.distortion_loss_mult * metrics_dict["distortion"]
+                
                 prop_depth_mult = conf.prop_lidar_loss_mult * conf.depth_mult
                 prop_carv_mult = conf.prop_lidar_loss_mult * conf.carving_mult
                 for i_prop in range(self.config.num_proposal_rounds):
-                    loss_dict[f"depth_loss_{i_prop}"] =  prop_depth_mult * metrics_dict[f"depth_loss_{i_prop}"]
+                    loss_dict[f"depth_loss_{i_prop}"] = prop_depth_mult * metrics_dict[f"depth_loss_{i_prop}"]
                     loss_dict[f"carving_loss_{i_prop}"] = prop_carv_mult * metrics_dict[f"carving_loss_{i_prop}"]
+            
             assert metrics_dict
             if "depth_loss" in metrics_dict:
-                loss_dict["depth_loss"] = 300 * conf.depth_mult * metrics_dict["depth_loss"]
+                loss_dict["depth_loss"] = 350 * conf.depth_mult * metrics_dict["depth_loss"]
             if "intensity_loss" in metrics_dict:
                 loss_dict["intensity_loss"] = conf.intensity_mult * metrics_dict["intensity_loss"]
             if "carving_loss" in metrics_dict:

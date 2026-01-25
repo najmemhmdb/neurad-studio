@@ -160,7 +160,7 @@ class PandaSet(ADDataParser):
         """Add noise to the poses."""
         extrinsic_cam2l = np.linalg.inv(extrinsic_l2cam)
         # extrinsic_l2cam[2, 3] -= 0.5
-        extrinsic_cam2l[:3, 3] -= 0.3
+        extrinsic_cam2l[:3, 3] -= 0.15
         new_cam2w = l2w @ extrinsic_cam2l
         return new_cam2w
     
@@ -176,9 +176,8 @@ class PandaSet(ADDataParser):
             l2front_cam = _pandaset_pose_to_matrix(front_cam_extrinsics)
             l2w = torch.from_numpy(front_cam2w @ l2front_cam)
             time = front_cam.timestamps[i]
-            for lidar in self.config.lidars:
-                poses.append(l2w)
-                times.append(time)
+            poses.append(l2w)
+            times.append(time)
         poses = torch.stack(poses)
         times = torch.tensor(times, dtype=torch.float64) 
 
@@ -197,20 +196,21 @@ class PandaSet(ADDataParser):
         idxs = []
         heights = []
         
-        l2ws, times = self._preload_lidars()
+        l2ws, times_lidar = self._preload_lidars()
 
         for i in range(PANDASET_SEQ_LEN):
             for camera in cameras:
-                interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times, curr_cam.timestamps[i])
+                curr_cam = self.sequence.camera[camera]
+                interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
                 extrinsic_l2cam = self.extrinsics[camera]
                 extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
                 extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
                 l2cam = _pandaset_pose_to_matrix(extrinsic_l2cam) 
                 
-                curr_cam = self.sequence.camera[camera]
+                
                 file_path = curr_cam._data_structure[i]
-                # pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
-                pose = self._add_noise(interpolated_l2w, l2cam, cameras.index(camera))
+                # pose = _ pandaset_pose_to_matrix(curr_cam.poses[i])
+                pose = self._add_noise(interpolated_l2w.squeeze(0), l2cam, cameras.index(camera))
                     
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
@@ -230,7 +230,7 @@ class PandaSet(ADDataParser):
                 heights.append(1080 - (250 if camera == "back_camera" else 0))
 
         intrinsics = torch.tensor(np.array(intrinsics), dtype=torch.float32)
-        poses = torch.tensor(np.array(poses), dtype=torch.float32)
+        poses = torch.stack(poses, dim=0).to(torch.float32)
         times = torch.tensor(times, dtype=torch.float64)  # need higher precision
         idxs = torch.tensor(idxs).int().unsqueeze(-1)
         cameras = Cameras(

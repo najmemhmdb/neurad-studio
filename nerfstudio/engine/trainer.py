@@ -204,7 +204,7 @@ class Trainer:
         self.early_stopping_tracker = self.config.early_stopping_tracker.setup()
 
         self.viewer_state = None
-
+        self.mask_alternate_indices_for_model = False
 
 
     def _recursive_to_cpu(self, obj):
@@ -752,7 +752,8 @@ class Trainer:
         Args:
             step: Current training step.
         """
-    
+        alternate_components = ["device_indicator_param", "dynamic_actors", "field", 
+                                "appearance_embedding", "rgb_decoder", "lidar_decoder", "proposal_fields"]
         needs_zero = [
             group for group in self.optimizers.parameters.keys() if step % self.gradient_accumulation_steps[group] == 0
         ]
@@ -760,15 +761,23 @@ class Trainer:
         cpu_or_cuda_str: str = self.device.split(":")[0]
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
 
+        if self.pipeline.config.model.skip_alternate_indices_for_model:
+            self.mask_alternate_indices_for_model = not self.mask_alternate_indices_for_model
+            if not self.mask_alternate_indices_for_model:
+                for name, p in self.pipeline.model.named_parameters():
+                    for key in alternate_components:
+                        if key in name:
+                            p.requires_grad_(False)
+
         with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
-            _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step)
+            _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step, mask_alternate_indices_for_model=self.mask_alternate_indices_for_model)
             loss = functools.reduce(torch.add, loss_dict.values())
             
             
         # Clean intermediate tensors before backward pass
         self.grad_scaler.scale(loss).backward()  # type: ignore
             
-     
+
         needs_step = [
             group
             for group in self.optimizers.parameters.keys()
@@ -792,7 +801,13 @@ class Trainer:
         # If the gradient scaler is decreased, no optimization step is performed so we should not step the scheduler.
         if scale <= self.grad_scaler.get_scale():
             self.optimizers.scheduler_step_all(step)
-        
+            
+        if self.pipeline.config.model.skip_alternate_indices_for_model:
+            if not self.mask_alternate_indices_for_model:
+                for name, p in self.pipeline.model.named_parameters():
+                    for key in alternate_components:
+                        if key in name:
+                            p.requires_grad_(True)
     
         # Merging loss and metrics dict into a single output.
         return loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt  # type: ignore
