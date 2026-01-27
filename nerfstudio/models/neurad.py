@@ -702,7 +702,7 @@ class NeuRADModel(ADModel):
             
             assert metrics_dict
             if "depth_loss" in metrics_dict:
-                loss_dict["depth_loss"] = 350 * conf.depth_mult * metrics_dict["depth_loss"]
+                loss_dict["depth_loss"] = 200 * conf.depth_mult * metrics_dict["depth_loss"]
             if "intensity_loss" in metrics_dict:
                 loss_dict["intensity_loss"] = conf.intensity_mult * metrics_dict["intensity_loss"]
             if "carving_loss" in metrics_dict:

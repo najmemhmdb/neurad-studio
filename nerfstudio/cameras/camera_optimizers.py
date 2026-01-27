@@ -23,7 +23,7 @@ import functools
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple, Type, Union
 import json
-
+import math
 import numpy
 import torch
 import tyro
@@ -426,39 +426,24 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         self.lidar_times = kwargs["lidar_times"].cuda()
         os.makedirs(f"calib_results/save/times", exist_ok=True)
         os.makedirs(f"calib_results/save/adjustments", exist_ok=True)
-        self.errors = { 0: {'x': [], 'y': [], 'z': []}, 
-                        1: {'x': [], 'y': [], 'z': []}, 
-                        2: {'x': [], 'y': [], 'z': []}, 
-                        3: {'x': [], 'y': [], 'z': []}, 
-                        4: {'x': [], 'y': [], 'z': []}, 
-                        5: {'x': [], 'y': [], 'z': []}}
+        self.errors = { i: {'x': [], 'y': [], 'z': [], 'error_angle': []} for i in range(self.camera_count)}
         # self.adjustment = torch.zeros((self.camera_count, 3, 4), device=device)
         eye = torch.eye(3)[None, :3, :4]
         constant = torch.zeros_like(eye[..., :, :1])
         self.mask_adj_rot = torch.cat([eye, constant], dim=-1).to('cuda')
-        # self.adjustment = torch.cat([eye, constant], dim=-1).to('cuda')
-        # self.active_idx = 0
-
-
-    # def target_row_this_step(self) -> int:
-    #     self.active_idx = (self.step_counter // 50) % self.camera_count
-        
-
-    # @torch.no_grad()
-    # def mask_extrinsics_grad_to_row(self):
-    #     self.target_row_this_step()
-    #     if self.extrinsics.grad is None:
-    #         return
-    #     mask = torch.zeros_like(self.extrinsics.grad)  # shape (6, 6)
-    #     mask[self.active_idx].fill_(1.0)
-    #     self.extrinsics.grad.mul_(mask)
-
+   
 
     def load_init_extrinsics(self):
         l2s_dict = yaml.load(open(os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml"), "r"), Loader=yaml.FullLoader)
         sensors = ["front_camera", "front_left_camera", "front_right_camera", "back_camera","left_camera","right_camera"]
-        sensor2lidar_list_gt = []
-        sensor2lidar_list_noisy = []
+        angles = {"front_camera": 0, 
+                  "front_left_camera": 45, 
+                  "front_right_camera": -45, 
+                  "back_camera": 180, 
+                  "left_camera": 90, 
+                  "right_camera": -90}
+        l2sensor_list_gt = []
+        l2sensor_list_noisy = []
         
         def _skew(w):
             wx, wy, wz = w
@@ -529,19 +514,19 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             l2sensor["position"] = l2s["extrinsic"]["transform"]["translation"]
             l2sensor["heading"] = l2s["extrinsic"]["transform"]["rotation"]
             l2sensor_4x4 = _pandaset_pose_to_matrix(l2sensor)
-            sensor2l_4x4 = np.linalg.inv(l2sensor_4x4)
-            sensor2lidar = torch.from_numpy(sensor2l_4x4[:3, :])
-            xi = mat4_to_SO3xR3_twist(sensor2lidar)
-            sensor2lidar_list_gt.append(xi)
+            lidar2sensor = torch.from_numpy(l2sensor_4x4[:3, :])
+            xi = mat4_to_SO3xR3_twist(lidar2sensor)
+            l2sensor_list_gt.append(xi)
 
-            sensor2l_4x4_noisy = sensor2l_4x4.copy()
-            # l2sensor_4x4_noisy[0, 3]  -= 2
-            sensor2l_4x4_noisy[:3, 3]  -= 0.15
-            sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy[:3, :])
-            xi_noisy = mat4_to_SO3xR3_twist(sensor2lidar_noisy)
-            sensor2lidar_list_noisy.append(xi_noisy)
+            l2sensor_4x4_noisy = l2sensor_4x4.copy()
+            l2sensor_4x4_noisy[:3, 3] = 0
+            noisy_rotation = get_noisy_rotation(angles[sensor])
+            l2sensor_4x4_noisy[:3, :3] = noisy_rotation
+            lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
+            xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
+            l2sensor_list_noisy.append(xi_noisy)
            
-        return torch.stack(sensor2lidar_list_gt).to(dtype=torch.float32), torch.stack(sensor2lidar_list_noisy).to(dtype=torch.float32)
+        return torch.stack(l2sensor_list_gt).to(dtype=torch.float32), torch.stack(l2sensor_list_noisy).to(dtype=torch.float32)
 
     
     def forward(self, all_indices: Int[Tensor, "camera_indices"]) -> Float[Tensor, "camera_indices 3 4"]:
@@ -571,7 +556,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             # interpolated_batch_lidar2w = self.lidar2w[seq_indices]
             lidar2w_4x4 = pose_utils.to4x4(interpolated_batch_lidar2w)
 
-            sensor2w = lidar2w_4x4 @ extrinsics_mapped
+            sensor2w = lidar2w_4x4 @ torch.inverse(extrinsics_mapped)
             R = sensor2w[:, :3, :3]
             sensor2w[:, :3, :3] = R @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).cuda().to(dtype=torch.float32)
 
@@ -580,6 +565,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             sensor2w_init = s2w_cameras.reshape(s2w_cameras.shape[0], 3, 4)
             init_4x4 = pose_utils.to4x4(sensor2w_init)
             adjustment = sensor2w @ torch.inverse(init_4x4) 
+
             outputs.append(adjustment[:, :3, :4])
             # outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(ext_indices.shape[0], 1, 1))
             if lidar_indices.any():
@@ -590,19 +576,25 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             with torch.no_grad():
                 camera_indices_unique = torch.unique(camera_indices.clone().detach())
                 for idx in camera_indices_unique:
-                    idx_mask = (ext_indices.clone().detach() // self.sequence_length) == idx
                     self.errors[idx.item()]['x'].append([self.step_counter, self.extrinsics_trans[idx.item()][0].item() - self.ext_init[idx.item()][0].item()])
                     self.errors[idx.item()]['y'].append([self.step_counter, self.extrinsics_trans[idx.item()][1].item() - self.ext_init[idx.item()][1].item()])
                     self.errors[idx.item()]['z'].append([self.step_counter, self.extrinsics_trans[idx.item()][2].item() - self.ext_init[idx.item()][2].item()])
-                
+
+                    # --- rotation error in *radians* (current minus GT) ---
+                    pred_rot = exp_map_SO3xR3(torch.cat([self.extrinsics_trans[idx.item()], self.extrinsics_rot[idx.item()]]).unsqueeze(0))[0, :3, :3]
+                    gt_rot = exp_map_SO3xR3(self.ext_init[idx.item()].unsqueeze(0))[0, :3, :3]
+                    error_angle = rotation_matrix_difference_angle_trace(pred_rot, gt_rot.cuda())
+                    self.errors[idx.item()]['error_angle'].append([self.step_counter, error_angle.item()])
+                    # del gt_rot
+                    # del pred_rot
                     
             # === periodically render & save ===
             if self.step_counter % 1000 == 0 or self.step_counter == 1:
-                fig, axes = plt.subplots(nrows=6, ncols=3, figsize=(15, 20))
-                axes = axes.reshape(6, 3)  # ensure it's a 2D array even if 6x3
+                fig, axes = plt.subplots(nrows=6, ncols=4, figsize=(15, 20))
+                axes = axes.reshape(6, 4)  # ensure it's a 2D array even if 6x6
 
-                colors = ['red', 'green', 'blue']
-                axes_labels = ['x', 'y', 'z']
+                colors = ['red', 'green', 'blue', 'red']
+                axes_labels = ['x', 'y', 'z', 'error_angle']
                 for row, keyword in enumerate(self.errors.keys()):
                     for col, axis in enumerate(axes_labels):
                         if len(self.errors[keyword][axis]) > 0:
@@ -618,8 +610,10 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                 plt.tight_layout()
                 plt.savefig(f"calib_results/save/adjustments/adjustments_{self.step_counter}_new.png", dpi=200)
                 plt.close(fig)
+
+                
                 for k in self.errors.keys():
-                    self.errors[k] = {'x': [], 'y': [], 'z': []}
+                    self.errors[k] = {'x': [], 'y': [], 'z': [], 'error_angle': []}
 
             return torch.cat(outputs, dim=0)
         else:
@@ -743,3 +737,30 @@ class ScaledCameraOptimizer(CameraOptimizer):
             loss_dict["camera_opt_regularizer"] = (
                 pose_adjustment[:, :3].abs() * self.trans_penalty
             ).mean() + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
+
+
+
+def get_noisy_rotation(angle: float) -> Tensor:
+    l2cam = torch.tensor([[0, 1, 0], [0, 0, -1], [-1, 0, 0]]).to(dtype=torch.float32)
+    rotation = torch.tensor([[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0], [0, 0, 1]]).to(dtype=torch.float32)
+    return rotation @ l2cam
+
+def rotation_matrix_difference_angle_trace(R1, R2):
+    """
+    Fastest method for PyTorch CUDA.
+    Returns angle in radians [0, pi]
+    """
+    # Compute relative rotation: R2 @ R1.T
+    R_diff = R2 @ R1.transpose(-2, -1)
+    
+    # Trace method: θ = arccos((trace(R) - 1) / 2)
+    trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)
+    
+    # Clamp for numerical stability
+    cos_angle = (trace - 1) / 2
+    cos_angle = cos_angle.clamp(-1.0, 1.0)
+    
+    # Compute angle
+    angle = torch.acos(cos_angle)
+    
+    return angle

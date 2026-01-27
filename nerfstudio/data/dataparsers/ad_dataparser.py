@@ -60,7 +60,7 @@ class ADDataParserConfig(DataParserConfig):
     """target class to instantiate"""
     sequence: str = "001"
     """Name of the sequence to load."""
-    train_split_fraction: float = 0.5
+    train_split_fraction: float = 0.9
     """The percent of images to use for training. The remaining images are for eval."""
     train_eval_split_type: SplitTypes = SplitTypes.LINSPACE
     """The type of split to use for train/eval."""

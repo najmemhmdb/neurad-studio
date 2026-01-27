@@ -158,9 +158,8 @@ class PandaSet(ADDataParser):
 
     def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray, idx: int) -> np.ndarray:
         """Add noise to the poses."""
+        extrinsic_l2cam[:3, 3] = 0
         extrinsic_cam2l = np.linalg.inv(extrinsic_l2cam)
-        # extrinsic_l2cam[2, 3] -= 0.5
-        extrinsic_cam2l[:3, 3] -= 0.15
         new_cam2w = l2w @ extrinsic_cam2l
         return new_cam2w
     
@@ -201,7 +200,7 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             for camera in cameras:
                 curr_cam = self.sequence.camera[camera]
-                interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
+                # interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
                 extrinsic_l2cam = self.extrinsics[camera]
                 extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
                 extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
@@ -210,7 +209,7 @@ class PandaSet(ADDataParser):
                 
                 file_path = curr_cam._data_structure[i]
                 # pose = _ pandaset_pose_to_matrix(curr_cam.poses[i])
-                pose = self._add_noise(interpolated_l2w.squeeze(0), l2cam, cameras.index(camera))
+                pose = self._add_noise(l2ws[i], l2cam, cameras.index(camera))
                     
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
