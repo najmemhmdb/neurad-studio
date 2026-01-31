@@ -437,63 +437,13 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         l2s_dict = yaml.load(open(os.path.join(os.path.dirname(__file__), "pandaset_extrinsics.yaml"), "r"), Loader=yaml.FullLoader)
         sensors = ["front_camera", "front_left_camera", "front_right_camera", "back_camera","left_camera","right_camera"]
         angles = {"front_camera": 0, 
-                  "front_left_camera": 45, 
-                  "front_right_camera": -45, 
+                  "front_left_camera": -45, 
+                  "front_right_camera": 45, 
                   "back_camera": 180, 
-                  "left_camera": 90, 
-                  "right_camera": -90}
+                  "left_camera": -90, 
+                  "right_camera": 90}
         l2sensor_list_gt = []
         l2sensor_list_noisy = []
-        
-        def _skew(w):
-            wx, wy, wz = w
-            z = torch.zeros((), dtype=w.dtype, device=w.device)
-            return torch.tensor([[0., -wz,  wy],
-                                [wz,  0., -wx],
-                                [-wy, wx,  0.]], dtype=w.dtype, device=w.device)
-
-        def so3_exp(phi):
-            # Rodrigues to mirror your exp_map_SO3xR3 rotation block
-            theta = torch.linalg.norm(phi)
-            I = torch.eye(3, dtype=phi.dtype, device=phi.device)
-            if theta < 1e-8:
-                K = _skew(phi)
-                return I + K + 0.5 * (K @ K)  # 2nd-order for stability
-            K = _skew(phi)
-            s, c = torch.sin(theta), torch.cos(theta)
-            a = s / theta
-            b = (1 - c) / (theta * theta)
-            return I + a * K + b * (K @ K)
-
-        def rotmat_to_rotvec_match_exp(R):
-            """
-            Log that matches the Rodrigues used in exp_map_SO3xR3.
-            Picks the sign so that so3_exp(phi) ≈ R (not R^T).
-            """
-            # Standard log (your implementation is fine)
-            trace = torch.clamp(torch.trace(R), -1.0, 3.0)
-            cos_theta = (trace - 1.0) * 0.5
-            cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-            theta = torch.acos(cos_theta)
-
-            if theta < 1e-6:
-                rx = 0.5 * (R[2,1] - R[1,2])
-                ry = 0.5 * (R[0,2] - R[2,0])
-                rz = 0.5 * (R[1,0] - R[0,1])
-                phi = torch.stack([rx, ry, rz])
-            else:
-                s = torch.sin(theta)
-                kx = (R[2,1] - R[1,2]) / (2.0 * s)
-                ky = (R[0,2] - R[2,0]) / (2.0 * s)
-                kz = (R[1,0] - R[0,1]) / (2.0 * s)
-                axis = torch.stack([kx, ky, kz])
-                axis = axis / (axis.norm() + 1e-12)
-                phi = axis * theta
-
-            # Pick the sign that best reconstructs R with our Rodrigues
-            err_pos = (so3_exp(phi)   - R).abs().max()
-            err_neg = (so3_exp(-phi)  - R).abs().max()
-            return phi if err_pos <= err_neg else -phi
 
         def mat4_to_SO3xR3_twist(T4x4: torch.Tensor) -> torch.Tensor:
             """
@@ -503,11 +453,64 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             T4x4 = T4x4.to(dtype=torch.float64)
             R = T4x4[:3, :3]
             t = T4x4[:3, 3]
-            # If R may be slightly non-orthonormal, project once:
-            # U, _, Vh = torch.linalg.svd(R); R = U @ Vh;  if torch.det(R) < 0: U[:, -1] *= -1; R = U @ Vh
-            phi = rotmat_to_rotvec_match_exp(R)
+            
+            # Project R to SO(3) if needed (important for numerical stability)
+            U, _, Vh = torch.linalg.svd(R)
+            R_proj = U @ Vh
+            if torch.det(R_proj) < 0:
+                U[:, -1] *= -1
+                R_proj = U @ Vh
+            
+            # Use standard log map consistent with exp_map_SO3xR3
+            phi = _rotmat_to_rotvec_consistent(R_proj)
+        
             return torch.cat([t, phi])
-                    
+
+        def _rotmat_to_rotvec_consistent(R: torch.Tensor) -> torch.Tensor:
+            """
+            Logarithmic map SO(3) -> so(3) that matches exp_map_SO3xR3 convention.
+            Returns rotation vector phi such that exp_map_SO3xR3([0,0,0,phi]) reconstructs R.
+            """
+            trace = torch.clamp(torch.trace(R), -1.0, 3.0)
+            cos_theta = (trace - 1.0) * 0.5
+            cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+            theta = torch.acos(cos_theta)
+            
+            # Handle small angles
+            if theta < 1e-8:
+                rx = 0.5 * (R[2, 1] - R[1, 2])
+                ry = 0.5 * (R[0, 2] - R[2, 0])
+                rz = 0.5 * (R[1, 0] - R[0, 1])
+                phi = torch.stack([rx, ry, rz])
+            else:
+                # Standard formula - note the sign convention matches exp_map_SO3xR3
+                # The axis direction is extracted from R - R^T
+                axis = torch.stack([
+                    R[2, 1] - R[1, 2],
+                    R[0, 2] - R[2, 0],
+                    R[1, 0] - R[0, 1]
+                ])
+                axis = axis / (2.0 * torch.sin(theta))
+                phi = axis * theta
+            
+            # Test reconstruction to ensure correctness
+            test_twist = torch.cat([torch.zeros(3, dtype=R.dtype, device=R.device), phi])
+            test_twist = test_twist.unsqueeze(0)  # Add batch dimension
+            R_recon = exp_map_SO3xR3(test_twist)[0, :3, :3]
+            
+            # Check if reconstruction matches original
+            if torch.norm(R_recon - R) > 1e-4:
+                # Try negative angle (rotation in opposite direction)
+                phi_neg = -phi
+                test_twist_neg = torch.cat([torch.zeros(3, dtype=R.dtype, device=R.device), phi_neg])
+                test_twist_neg = test_twist_neg.unsqueeze(0)
+                R_recon_neg = exp_map_SO3xR3(test_twist_neg)[0, :3, :3]
+                
+                if torch.norm(R_recon_neg - R) < torch.norm(R_recon - R):
+                    phi = phi_neg
+            
+            return phi
+           
         for i,sensor in enumerate(sensors):
             l2s = l2s_dict[sensor]
             l2sensor = {}
@@ -520,8 +523,11 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
             l2sensor_4x4_noisy[:3, 3] = 0
-            noisy_rotation = get_noisy_rotation(angles[sensor])
-            l2sensor_4x4_noisy[:3, :3] = noisy_rotation
+            # l2cam, _ = decompose_yaw_plus_axis(l2sensor_4x4_noisy[:3, :3])
+            yaw_new_R = yaw_rotation(math.radians(angles[sensor]))
+            # R_new  = yaw_new_R.to(dtype=torch.float64) @ l2cam
+            # l2sensor_4x4_noisy[:3, :3] =  R_new.cpu().numpy()
+            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
             lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
             xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
             l2sensor_list_noisy.append(xi_noisy)
@@ -740,10 +746,24 @@ class ScaledCameraOptimizer(CameraOptimizer):
 
 
 
-def get_noisy_rotation(angle: float) -> Tensor:
-    l2cam = torch.tensor([[0, 1, 0], [0, 0, -1], [-1, 0, 0]]).to(dtype=torch.float32)
-    rotation = torch.tensor([[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0], [0, 0, 1]]).to(dtype=torch.float32)
-    return rotation @ l2cam
+def yaw_rotation(yaw_rad: float) -> Tensor:
+    """Create a rotation matrix with specified yaw angle"""
+    yaw_rotation = torch.tensor([
+        [math.cos(yaw_rad), -math.sin(yaw_rad), 0],
+        [math.sin(yaw_rad), math.cos(yaw_rad), 0],
+        [0, 0, 1]
+    ], dtype=torch.float32)
+
+    l2cam = torch.tensor([
+        [-0.9998236, 0.0000400, 0.0000979],
+        [0.000224, 0.0001868, -1.0000977],
+        [0.0000950, -1.0000151, -0.0000103]
+    ], dtype=torch.float32)
+    
+    
+    return l2cam @ yaw_rotation
+
+
 
 def rotation_matrix_difference_angle_trace(R1, R2):
     """
