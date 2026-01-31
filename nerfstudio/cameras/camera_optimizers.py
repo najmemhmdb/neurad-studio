@@ -18,7 +18,6 @@ Pose and Intrinsics Optimizers
 """
 
 from __future__ import annotations
-import open3d as o3d
 import functools
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple, Type, Union
@@ -52,9 +51,6 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # headless save
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-import open3d as o3d
-import matplotlib.pyplot as plt 
 
 @dataclass
 class CameraOptimizerConfig(InstantiateConfig):
@@ -520,8 +516,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
             l2sensor_4x4_noisy[:3, 3] = 0
-            noisy_rotation = get_noisy_rotation(angles[sensor])
-            l2sensor_4x4_noisy[:3, :3] = noisy_rotation
+            # noisy_rotation = get_noisy_rotation(angles[sensor])
+            # l2sensor_4x4_noisy[:3, :3] = noisy_rotation
             lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
             xi_noisy = mat4_to_SO3xR3_twist(lidar2sensor_noisy)
             l2sensor_list_noisy.append(xi_noisy)
