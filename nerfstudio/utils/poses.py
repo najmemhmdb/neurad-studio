@@ -319,7 +319,7 @@ def vectorized_interpolate(poses, pose_times, query_times, atol=0.0):
     # Translation: linear (also fp32 for stability)
     t = (t0p.float() + alpha_f.unsqueeze(-1) * (t1p.float() - t0p.float())).to(dtype)  # [B,3]
 
-    out = torch.empty(B, 3, 4, dtype=dtype, device=device)
+    out = torch.zeros(B, 3, 4, dtype=dtype, device=device)
     out[..., :3, :3] = R
     out[..., :3, 3]  = t
 
