@@ -114,3 +114,167 @@ def exp_map_SE3(tangent_vector: Float[Tensor, "b 6"]) -> Float[Tensor, "b 3 4"]:
         tangent_vector_ang @ (tangent_vector_ang.transpose(1, 2) @ tangent_vector_lin)
     )
     return ret
+
+
+import torch
+from jaxtyping import Float
+from torch import Tensor
+
+def log_map_SE3(transform: Float[Tensor, "b 3 4"]) -> Float[Tensor, "b 6"]:
+    """Compute the logarithm map `SE(3) -> se(3)`.
+    
+    This is the inverse of exp_map_SE3, converting transformation matrices
+    back to tangent vectors.
+    
+    Args:
+        transform: [R|t] transformation matrices of shape (b, 3, 4).
+    
+    Returns:
+        tangent_vector: A tangent vector from se(3) of shape (b, 6).
+            [:, :3] = linear part, [:, 3:] = angular part
+    """
+    batch_size = transform.shape[0]
+    device = transform.device
+    dtype = transform.dtype
+    
+    # Extract rotation and translation
+    R = transform[:, :3, :3]  # (b, 3, 3)
+    t = transform[:, :3, 3]  # (b, 3)
+    
+    # Compute rotation angle
+    trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+    cos_theta = (trace - 1.0) / 2.0
+    theta = torch.acos(torch.clamp(cos_theta, -1.0, 1.0))
+    
+    # Initialize output
+    tangent_vector = torch.zeros(batch_size, 6, dtype=dtype, device=device)
+    
+    # Determine which case we're in
+    near_zero = theta < 1e-2
+    near_pi = theta > (torch.pi - 1e-2)
+    normal = ~(near_zero | near_pi)
+    
+    # NEAR ZERO CASE
+    if near_zero.any():
+        idx = near_zero
+        # omega from antisymmetric part
+        tangent_vector[idx, 3] = (R[idx, 2, 1] - R[idx, 1, 2]) / 2.0
+        tangent_vector[idx, 4] = (R[idx, 0, 2] - R[idx, 2, 0]) / 2.0
+        tangent_vector[idx, 5] = (R[idx, 1, 0] - R[idx, 0, 1]) / 2.0
+        # translation is just t
+        tangent_vector[idx, :3] = t[idx]
+    
+    # NEAR PI CASE (θ ≈ π)
+    if near_pi.any():
+        idx = near_pi
+        n = idx.sum().item()
+        
+        for i in range(n):
+            batch_idx = torch.where(idx)[0][i]
+            R_i = R[batch_idx]
+            theta_i = theta[batch_idx]
+            
+            # Find the rotation axis from (R + I)
+            # The axis is the eigenvector corresponding to eigenvalue +1
+            B = R_i + torch.eye(3, dtype=dtype, device=device)
+            
+            # Find column with largest norm (most stable)
+            col_norms = torch.sqrt((B ** 2).sum(dim=0))
+            max_col = torch.argmax(col_norms)
+            
+            # Extract and normalize the axis
+            k = B[:, max_col]
+            k = k / torch.linalg.norm(k)
+            
+            # Determine the sign of k using the antisymmetric part
+            # For theta near pi, R - R^T is still informative about direction
+            R_antisym = R_i - R_i.T
+            # Extract the direction from antisymmetric part
+            v_antisym = torch.tensor([R_antisym[2, 1], R_antisym[0, 2], R_antisym[1, 0]], 
+                                     dtype=dtype, device=device)
+            
+            # If the signs don't match, flip k
+            if torch.dot(k, v_antisym) < 0:
+                k = -k
+            
+            # omega = theta * k
+            omega = theta_i * k
+            tangent_vector[batch_idx, 3:] = omega
+            
+            # Compute V_inv for translation
+            omega_col = omega.view(3, 1)
+            
+            # Build skew-symmetric matrix
+            omega_skew = torch.zeros(3, 3, dtype=dtype, device=device)
+            omega_skew[0, 1] = -omega[2]
+            omega_skew[0, 2] = omega[1]
+            omega_skew[1, 0] = omega[2]
+            omega_skew[1, 2] = -omega[0]
+            omega_skew[2, 0] = -omega[1]
+            omega_skew[2, 1] = omega[0]
+            
+            omega_skew_sq = omega_skew @ omega_skew
+            theta2 = theta_i ** 2
+            half_theta = theta_i / 2.0
+            
+            # For theta near pi, use the limiting form
+            # V^{-1} = I - (1/2)*[omega]_x + ((1 - (theta/2)*cot(theta/2))/theta^2)*[omega]_x^2
+            sin_half = torch.sin(half_theta)
+            cos_half = torch.cos(half_theta)
+            
+            if sin_half.abs() > 1e-6:
+                cot_half = cos_half / sin_half
+                coeff = (1.0 - half_theta * cot_half) / theta2
+            else:
+                # Use Taylor expansion for theta very close to pi
+                coeff = 1.0 / 12.0  # limiting value
+            
+            V_inv = (torch.eye(3, dtype=dtype, device=device)
+                     - 0.5 * omega_skew
+                     + coeff * omega_skew_sq)
+            
+            tangent_vector[batch_idx, :3] = (V_inv @ t[batch_idx].unsqueeze(-1)).squeeze(-1)
+    
+    # NORMAL CASE
+    if normal.any():
+        idx = normal
+        theta_val = theta[idx]
+        sin_theta = torch.sin(theta_val)
+        
+        # Extract omega (angular part)
+        factor = theta_val / (2.0 * sin_theta)
+        tangent_vector[idx, 3] = factor * (R[idx, 2, 1] - R[idx, 1, 2])
+        tangent_vector[idx, 4] = factor * (R[idx, 0, 2] - R[idx, 2, 0])
+        tangent_vector[idx, 5] = factor * (R[idx, 1, 0] - R[idx, 0, 1])
+        
+        # Compute V^{-1}
+        omega = tangent_vector[idx, 3:].view(-1, 3, 1)  # (n, 3, 1)
+        theta_val = theta_val.view(-1, 1, 1)  # (n, 1, 1)
+        
+        # Build skew-symmetric matrix [omega]_x
+        n = idx.sum()
+        omega_skew = torch.zeros(n, 3, 3, dtype=dtype, device=device)
+        omega_skew[:, 0, 1] = -omega[:, 2, 0]
+        omega_skew[:, 0, 2] = omega[:, 1, 0]
+        omega_skew[:, 1, 0] = omega[:, 2, 0]
+        omega_skew[:, 1, 2] = -omega[:, 0, 0]
+        omega_skew[:, 2, 0] = -omega[:, 1, 0]
+        omega_skew[:, 2, 1] = omega[:, 0, 0]
+        
+        omega_skew_sq = omega_skew @ omega_skew
+        
+        theta2 = theta_val ** 2
+        half_theta = theta_val / 2.0
+        
+        # Coefficient for [omega]_x^2 term
+        coeff = (1.0 / theta2) * (1.0 - theta_val * torch.cos(half_theta) / (2.0 * torch.sin(half_theta)))
+        
+        V_inv = (torch.eye(3, dtype=dtype, device=device).unsqueeze(0)
+                 - 0.5 * omega_skew
+                 + coeff * omega_skew_sq)
+        
+        # Apply V^{-1} to translation
+        t_inv = (V_inv @ t[idx].unsqueeze(-1)).squeeze(-1)
+        tangent_vector[idx, :3] = t_inv
+    
+    return tangent_vector
