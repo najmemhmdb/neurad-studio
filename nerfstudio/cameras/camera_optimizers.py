@@ -18,7 +18,6 @@ Pose and Intrinsics Optimizers
 """
 
 from __future__ import annotations
-import open3d as o3d
 import functools
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple, Type, Union
@@ -52,9 +51,6 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # headless save
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-import open3d as o3d
-import matplotlib.pyplot as plt 
 
 @dataclass
 class CameraOptimizerConfig(InstantiateConfig):
