@@ -39,6 +39,7 @@ from nerfstudio.engine.schedulers import SchedulerConfig
 from nerfstudio.utils import poses as pose_utils
 from nerfstudio.data.dataparsers.pandaset_dataparser import _pandaset_pose_to_matrix
 from nerfstudio.data.dataparsers.ad_dataparser import OPENCV_TO_NERFSTUDIO
+from nerfstudio.cameras.camera_utils import yaw_rotation_function
 import os
 import json
 import yaml
@@ -518,7 +519,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                     # --- rotation error in *radians* (current minus GT) ---
                     
                     error_angle = rotation_matrix_difference_angle_trace(pred_extrinsic[:, :3, :3], gt_extrinsic[:, :3, :3].cuda())
-                    self.errors[idx.item()]['error_angle'].append([self.step_counter, error_angle.item()])
+                    self.errors[idx.item()]['error_angle'].append([self.step_counter,  math.degrees(error_angle.item())])
                     # del gt_rot
                     # del pred_rot
                     
@@ -672,29 +673,6 @@ class ScaledCameraOptimizer(CameraOptimizer):
                 pose_adjustment[:, :3].abs() * self.trans_penalty
             ).mean() + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
 
-
-
-def yaw_rotation_function(yaw_rad: float) -> Tensor:
-    """Create a rotation matrix with specified yaw angle"""
-    yaw_rotation = torch.tensor([
-        [math.cos(yaw_rad), -math.sin(yaw_rad), 0],
-        [math.sin(yaw_rad), math.cos(yaw_rad), 0],
-        [0, 0, 1]
-    ], dtype=torch.float32)
-
-    # l2cam = torch.tensor([
-    #     [-0.9998236, 0.0000400, 0.0000979],
-    #     [0.000224, 0.0001868, -1.0000977],
-    #     [0.0000950, -1.0000151, -0.0000103]
-    # ], dtype=torch.float32)
-    
-    l2cam = torch.tensor([
-        [-1, 0, 0],
-        [0, 0, -1],
-        [0, -1, 0]
-    ], dtype=torch.float32)
-
-    return l2cam @ yaw_rotation
 
 
 

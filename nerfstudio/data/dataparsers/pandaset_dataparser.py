@@ -19,14 +19,13 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Literal, Tuple, Type
-
+import math
 import numpy as np
 import pandas as pd
 import pyquaternion
 import torch
 import yaml
 from pandaset import DataSet
-
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.cameras.lidars import Lidars, LidarType
 from nerfstudio.data.dataparsers.ad_dataparser import (
@@ -38,6 +37,7 @@ from nerfstudio.data.dataparsers.ad_dataparser import (
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.utils.lidar_elevation_mappings import PANDAR64_ELEVATION_MAPPING
 from nerfstudio.utils import poses as pose_utils
+from nerfstudio.cameras.camera_utils import yaw_rotation_function
 PANDASET_ELEVATION_MAPPING = {"Pandar64": PANDAR64_ELEVATION_MAPPING}
 
 LIDAR_NAME_TO_INDEX = {
@@ -156,9 +156,11 @@ class PandaSet(ADDataParser):
         return LANE_SHIFT_SIGN.get(sequence, 1)
     
 
-    def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray, idx: int) -> np.ndarray:
+    def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray, angle: int) -> np.ndarray:
         """Add noise to the poses."""
         extrinsic_l2cam[:3, 3] = 0
+        yaw_new_R = yaw_rotation_function(math.radians(angle))
+        extrinsic_l2cam[:3, :3] = yaw_new_R.cpu().numpy()
         extrinsic_cam2l = np.linalg.inv(extrinsic_l2cam)
         new_cam2w = l2w @ extrinsic_cam2l
         return new_cam2w
@@ -187,6 +189,12 @@ class PandaSet(ADDataParser):
         if "all" in self.config.cameras:
             self.config.cameras = AVAILABLE_CAMERAS
         cameras = [cam + "_camera" for cam in self.config.cameras]
+        angles = {"front_camera": 0, 
+                  "front_left_camera": -45, 
+                  "front_right_camera": 45, 
+                  "back_camera": 180, 
+                  "left_camera": -90, 
+                  "right_camera": 90}
         # get image filenames and camera data
         image_filenames = []
         times = []
@@ -200,7 +208,7 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             for camera in cameras:
                 curr_cam = self.sequence.camera[camera]
-                # interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
+                interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
                 extrinsic_l2cam = self.extrinsics[camera]
                 extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
                 extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
@@ -209,7 +217,7 @@ class PandaSet(ADDataParser):
                 
                 file_path = curr_cam._data_structure[i]
                 # pose = _ pandaset_pose_to_matrix(curr_cam.poses[i])
-                pose = self._add_noise(l2ws[i], l2cam, cameras.index(camera))
+                pose = self._add_noise(interpolated_l2w.squeeze(0), l2cam, angles[camera])
                     
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 intrinsic_ = curr_cam.intrinsics
