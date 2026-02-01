@@ -45,8 +45,6 @@ import json
 import yaml
 import numpy as np
 
-
-import pypose as pp
 import os
 import numpy as np
 import matplotlib
