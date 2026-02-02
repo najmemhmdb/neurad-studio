@@ -345,7 +345,7 @@ class CameraLidarTemporalOptimizerConfig(InstantiateConfig):
 
     _target: Type = field(default_factory=lambda: CameraLidarTemporalOptimizer)
 
-    mode: Literal["off", "SO3xR3", "SE3"] = "SE3"
+    mode: Literal["off", "SO3xR3", "SE3"] = "SO3xR3"
     """Pose optimization strategy to use. If enabled, we recommend SO3xR3."""
 
     trans_l2_penalty: Union[Tuple, float] = 1e-2
@@ -440,6 +440,73 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         l2sensor_list_gt = []
         l2sensor_list_noisy = []
 
+        def mat4_to_SO3xR3_twist(T4x4: torch.Tensor) -> torch.Tensor:
+            """
+            Convert a 4x4 transform to the 6D vector for exp_map_SO3xR3.
+            Returns xi = [t_x, t_y, t_z, phi_x, phi_y, phi_z] (shape [6]).
+            """
+            T4x4 = T4x4.to(dtype=torch.float64)
+            R = T4x4[:3, :3]
+            t = T4x4[:3, 3]
+            
+            # Project R to SO(3) if needed (important for numerical stability)
+            U, _, Vh = torch.linalg.svd(R)
+            R_proj = U @ Vh
+            if torch.det(R_proj) < 0:
+                U[:, -1] *= -1
+                R_proj = U @ Vh
+            
+            # Use standard log map consistent with exp_map_SO3xR3
+            phi = _rotmat_to_rotvec_consistent(R_proj)
+        
+            return torch.cat([t, phi])
+
+        def _rotmat_to_rotvec_consistent(R: torch.Tensor) -> torch.Tensor:
+            """
+            Logarithmic map SO(3) -> so(3) that matches exp_map_SO3xR3 convention.
+            Returns rotation vector phi such that exp_map_SO3xR3([0,0,0,phi]) reconstructs R.
+            """
+            trace = torch.clamp(torch.trace(R), -1.0, 3.0)
+            cos_theta = (trace - 1.0) * 0.5
+            cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+            theta = torch.acos(cos_theta)
+            
+            # Handle small angles
+            if theta < 1e-8:
+                rx = 0.5 * (R[2, 1] - R[1, 2])
+                ry = 0.5 * (R[0, 2] - R[2, 0])
+                rz = 0.5 * (R[1, 0] - R[0, 1])
+                phi = torch.stack([rx, ry, rz])
+            else:
+                # Standard formula - note the sign convention matches exp_map_SO3xR3
+                # The axis direction is extracted from R - R^T
+                axis = torch.stack([
+                    R[2, 1] - R[1, 2],
+                    R[0, 2] - R[2, 0],
+                    R[1, 0] - R[0, 1]
+                ])
+                axis = axis / (2.0 * torch.sin(theta))
+                phi = axis * theta
+            
+            # Test reconstruction to ensure correctness
+            test_twist = torch.cat([torch.zeros(3, dtype=R.dtype, device=R.device), phi])
+            test_twist = test_twist.unsqueeze(0)  # Add batch dimension
+            R_recon = exp_map_SO3xR3(test_twist)[0, :3, :3]
+            
+            # Check if reconstruction matches original
+            if torch.norm(R_recon - R) > 1e-4:
+                # Try negative angle (rotation in opposite direction)
+                phi_neg = -phi
+                test_twist_neg = torch.cat([torch.zeros(3, dtype=R.dtype, device=R.device), phi_neg])
+                test_twist_neg = test_twist_neg.unsqueeze(0)
+                R_recon_neg = exp_map_SO3xR3(test_twist_neg)[0, :3, :3]
+                
+                if torch.norm(R_recon_neg - R) < torch.norm(R_recon - R):
+                    phi = phi_neg
+            
+            return phi
+           
+
         for i,sensor in enumerate(sensors):
             l2s = l2s_dict[sensor]
             l2sensor = {}
@@ -447,21 +514,21 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             l2sensor["heading"] = l2s["extrinsic"]["transform"]["rotation"]
             l2sensor_4x4 = _pandaset_pose_to_matrix(l2sensor)
             lidar2sensor = torch.from_numpy(l2sensor_4x4[:3, :])
-
-            l2sensor_list_gt.append(log_map_SE3(lidar2sensor.unsqueeze(0)).squeeze(0))
+            l2sensor_list_gt.append(mat4_to_SO3xR3_twist(lidar2sensor))
 
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
             l2sensor_4x4_noisy[:3, 3] = 0
-            yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
-            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
-            l2sensor_list_noisy.append(log_map_SE3(torch.from_numpy(l2sensor_4x4_noisy[:3, :]).unsqueeze(0)).squeeze(0))
+            # yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
+            # l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
+            lidar2sensor_noisy = torch.from_numpy(l2sensor_4x4_noisy[:3, :])
+            l2sensor_list_noisy.append(mat4_to_SO3xR3_twist(lidar2sensor_noisy))
            
         return torch.stack(l2sensor_list_gt).to(dtype=torch.float32), torch.stack(l2sensor_list_noisy).to(dtype=torch.float32)
 
     
     def forward(self, all_indices: Int[Tensor, "camera_indices"]) -> Float[Tensor, "camera_indices 3 4"]:
-        if self.config.mode == "SE3":
+        if self.config.mode == "SO3xR3":
             outputs = []
             mask_ext = all_indices < (self.sequence_length * self.camera_count)
             ext_indices = all_indices[mask_ext]
@@ -477,7 +544,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             seq_indices = ext_indices % self.sequence_length  #[batch size]
             query_times = self.lidar_times[seq_indices] + camera_offsets
             
-            extrinsics_mapped = pose_utils.to4x4(exp_map_SE3(extrinsics))
+            extrinsics_mapped = pose_utils.to4x4(exp_map_SO3xR3(extrinsics))
             
             interpolated_batch_lidar2w = pose_utils.vectorized_interpolate(
                                             self.lidar2w, self.lidar_times, query_times
@@ -507,8 +574,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             with torch.no_grad():
                 camera_indices_unique = torch.unique(camera_indices.clone().detach())
                 for idx in camera_indices_unique:
-                    pred_extrinsic = exp_map_SE3(torch.cat([self.extrinsics_trans[idx.item()], self.extrinsics_rot[idx.item()]]).unsqueeze(0))
-                    gt_extrinsic = exp_map_SE3(self.ext_init[idx.item()].unsqueeze(0))
+                    pred_extrinsic = exp_map_SO3xR3(torch.cat([self.extrinsics_trans[idx.item()], self.extrinsics_rot[idx.item()]]).unsqueeze(0))
+                    gt_extrinsic = exp_map_SO3xR3(self.ext_init[idx.item()].unsqueeze(0))
 
                     self.errors[idx.item()]['x'].append([self.step_counter, gt_extrinsic[0, 0, 3].item() - pred_extrinsic[0, 0, 3].item()])
                     self.errors[idx.item()]['y'].append([self.step_counter, gt_extrinsic[0, 1, 3].item() - pred_extrinsic[0, 1, 3].item()])
