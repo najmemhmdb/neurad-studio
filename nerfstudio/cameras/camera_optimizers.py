@@ -503,7 +503,9 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             s2w_cameras = self.camera_to_worlds[ext_indices.cpu()].to(sensor2w.device)
             sensor2w_init = s2w_cameras.reshape(s2w_cameras.shape[0], 3, 4)
             init_4x4 = pose_utils.to4x4(sensor2w_init)
-            adjustment = sensor2w @ torch.inverse(init_4x4) 
+            R_delta = sensor2w[:, :3, :3] @ init_4x4[:, :3, :3].transpose(-1, -2)
+            t_delta = sensor2w[:, :3, 3] - init_4x4[:, :3, 3]
+            adjustment = torch.cat([R_delta, t_delta[..., None]], dim=-1)  # (B,3,4)
 
             outputs.append(adjustment[:, :3, :4])
             # outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(ext_indices.shape[0], 1, 1))
