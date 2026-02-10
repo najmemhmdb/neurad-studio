@@ -449,19 +449,16 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             sensor2l_4x4 = np.linalg.inv(l2sensor_4x4)
             sensor2lidar = torch.from_numpy(sensor2l_4x4)
             sensor2lidar[:3, :3] = sensor2lidar[:3, :3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
-            # sensor2lidar[:3, 3] = sensor2lidar[:3, 3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
             
             sensor2lidar_list_gt.append(mat4_to_SO3xR3_twist(sensor2lidar[:3, :]))
 
-
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
-            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
+            # yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
+            # l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
             sensor2l_4x4_noisy = np.linalg.inv(l2sensor_4x4_noisy)
             sensor2l_4x4_noisy[:3, 3] = 0
             sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy)
             sensor2lidar_noisy[:3, :3] = sensor2lidar_noisy[:3, :3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
-            # sensor2lidar_noisy[:3, 3] = sensor2lidar_noisy[:3, 3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
             
             sensor2lidar_list_noisy.append(mat4_to_SO3xR3_twist(sensor2lidar_noisy[:3, :]))
            
@@ -470,10 +467,12 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
     
     def forward(self, all_indices: Int[Tensor, "camera_indices"]) -> Float[Tensor, "camera_indices 3 4"]:
         if self.config.mode == "SO3xR3":
-            outputs = []
+            output_mats = torch.eye(4, device=all_indices.device, dtype=torch.float32)[None, :3, :4].repeat(
+                all_indices.shape[0], 1, 1
+            )
+
             mask_ext = all_indices < (self.sequence_length * self.camera_count)
             ext_indices = all_indices[mask_ext]
-            lidar_indices = all_indices[~mask_ext]
             self.step_counter += 1
 
             ext_adjustments = self._get_ext_adjustment()
@@ -503,14 +502,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             s2w_cameras = self.camera_to_worlds[ext_indices.cpu()].to(sensor2w.device)
             sensor2w_init = s2w_cameras.reshape(s2w_cameras.shape[0], 3, 4)
             init_4x4 = pose_utils.to4x4(sensor2w_init)
-            # R_delta = sensor2w[:, :3, :3] @ init_4x4[:, :3, :3].transpose(-1, -2)
-            # t_delta = sensor2w[:, :3, 3] - init_4x4[:, :3, 3]
-            # adjustment = torch.cat([R_delta, t_delta[..., None]], dim=-1)  # (B,3,4)
             adjustment = sensor2w @ torch.inverse(init_4x4) # (B,3,4)
-            outputs.append(adjustment[:, :3, :4])
-            # outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(ext_indices.shape[0], 1, 1))
-            if lidar_indices.any():
-                outputs.append(torch.eye(4, device=adjustment.device)[None, :3, :4].tile(lidar_indices.shape[0], 1, 1))
+            output_mats[mask_ext] = adjustment[:, :3, :4]
             self.adjustment = adjustment[:, :3, :4]
 
             # visualization and debug information
@@ -558,7 +551,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                 for k in self.errors.keys():
                     self.errors[k] = {'x': [], 'y': [], 'z': [], 'error_angle': []}
 
-            return torch.cat(outputs, dim=0)
+            return output_mats
         else:
             raise ValueError(f"Not implemented for {self.config.mode}")
             
@@ -580,9 +573,9 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                 R = correction_matrices[:, :3, :3]
                 t = correction_matrices[:, :3, 3]
                 
-                raybundle.origins = (torch.bmm(R, raybundle.origins[..., None]).squeeze(-1) + t).to(raybundle.origins)
+                # raybundle.origins = (torch.bmm(R, raybundle.origins[..., None]).squeeze(-1) + t).to(raybundle.origins)
 
-                # raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
+                raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
                 raybundle.directions = (
                     torch.bmm(R, raybundle.directions[..., None])
                     .squeeze()
