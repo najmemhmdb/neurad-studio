@@ -28,10 +28,10 @@ import torch
 from scipy.spatial.transform import Rotation as R
 import cv2
 import numpy.typing as npt
-try:
-    import open3d as o3d
-except ImportError:
-    raise ImportError("open3d is required for reading PCD files. Install it with: pip install open3d")
+# try:
+#     import open3d as o3d
+# except ImportError:
+#     raise ImportError("open3d is required for reading PCD files. Install it with: pip install open3d")
 
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.cameras.lidars import Lidars, LidarType

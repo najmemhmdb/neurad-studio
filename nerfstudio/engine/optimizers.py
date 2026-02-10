@@ -27,7 +27,7 @@ from torch.nn.parameter import Parameter
 
 from nerfstudio.configs import base_config
 from nerfstudio.utils import writer
-
+from typing import Tuple
 
 # Optimizer related configs
 @dataclass
@@ -56,9 +56,17 @@ class OptimizerConfig(base_config.PrintableConfig):
 @dataclass
 class AdamOptimizerConfig(OptimizerConfig):
     """Basic optimizer config with Adam"""
-
     _target: Type = torch.optim.Adam
     weight_decay: float = 0
+
+    """The weight decay to use."""
+
+@dataclass
+class CustomAdamOptimizerConfig(OptimizerConfig):
+    """Basic optimizer config with Adam"""
+    _target: Type = torch.optim.Adam
+    weight_decay: float = 0
+    betas: Tuple[float, float] = (0.999, 0.999)
     """The weight decay to use."""
 
 

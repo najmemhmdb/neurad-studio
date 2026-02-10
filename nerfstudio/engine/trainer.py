@@ -34,7 +34,6 @@ from rich import box, style
 from rich.panel import Panel
 from rich.table import Table
 from torch.cuda.amp.grad_scaler import GradScaler
-
 from nerfstudio.configs.base_config import InstantiateConfig
 from nerfstudio.configs.experiment_config import ExperimentConfig
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
@@ -49,6 +48,8 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.writer import EventName, TimeWriter
 from nerfstudio.viewer.viewer import Viewer as ViewerState
 from nerfstudio.viewer_legacy.server.viewer_state import ViewerLegacyState
+import copy
+import gc, torch
 
 TRAIN_INTERATION_OUTPUT = Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
 TORCH_DEVICE = str
@@ -142,6 +143,12 @@ class TrainerConfig(ExperimentConfig):
     """Optionally log gradients during training"""
     gradient_accumulation_steps: Dict[str, int] = field(default_factory=lambda: {})
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
+    reset_at_steps: List[int] = field(default_factory=lambda: [0, 2000, 4000, 6000, 8000])   # set None to disable resetting
+    """Optionally specify the step to reset the model and optimizer states."""
+    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0])
+    """Optionally specify the camera resolution scale factor to use at the reset steps."""
+    _reset_exclude_key_substrings: List[str] = field(default_factory=lambda: ["camera_optimizer."])
+    """Optionally specify the key substrings to exclude from the reset."""
 
 
 class Trainer:
@@ -197,7 +204,153 @@ class Trainer:
         self.early_stopping_tracker = self.config.early_stopping_tracker.setup()
 
         self.viewer_state = None
+        self.mask_alternate_indices_for_model = False
 
+
+    def _recursive_to_cpu(self, obj):
+        """Move tensors in (nested) containers to CPU so the snapshot doesn't double VRAM."""
+        # Move to CPU with explicit cleanup
+    def move_to_cpu(self, obj):
+        if torch.is_tensor(obj):
+            # Use .cpu() with non_blocking for async transfer
+            cpu_tensor = obj.detach().cpu()
+            # Make sure transfer is complete
+            if obj.is_cuda:
+                torch.cuda.synchronize()
+            # Clean up original tensor if it's on GPU
+            if obj.is_cuda:
+                del obj
+            return cpu_tensor
+        elif isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                result[k] = self.move_to_cpu(v)
+
+            del obj 
+            return result
+        elif isinstance(obj, list):
+            result = []
+            for i, v in enumerate(obj):
+                result.append(self.move_to_cpu(v))
+                obj[i] = None  # Clear reference
+            return result
+        elif isinstance(obj, tuple):
+            result = tuple(self.move_to_cpu(v) for v in obj)
+            # Can't modify tuple in place, but we can clear references
+            for i in range(len(obj)):
+                if isinstance(obj[i], torch.Tensor) and obj[i].is_cuda:
+                    del obj[i]
+            return result
+        else:
+            return obj
+
+    def _capture_reset_snapshot(self) -> Dict[str, object]:
+        """Move tensors in (nested) containers to CPU for snapshot."""
+        # Clear any cached memory before taking snapshot
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        
+        # Get pipeline state dict
+        pipe_sd = self.pipeline.module.state_dict() if hasattr(self.pipeline, "module") else self.pipeline.state_dict()
+        
+        # Create snapshot with minimal copying
+        snap = {
+            "pipeline": self.move_to_cpu(pipe_sd),
+            "optimizers": {k: self.move_to_cpu(opt.state_dict()) for k, opt in self.optimizers.optimizers.items()},
+            "schedulers": {k: self.move_to_cpu(sch.state_dict()) for k, sch in self.optimizers.schedulers.items()},
+            "scaler": self.move_to_cpu(self.grad_scaler.state_dict()),
+        }
+        
+        # Clear the original containers to free memory
+        del pipe_sd
+        # Clear cache after snapshot
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.empty_cache()
+        
+        return snap
+    
+
+    def _move_optimizer_state_to_device(self, optimizer: torch.optim.Optimizer, device: str) -> None:
+        dev = torch.device(device)
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(dev)
+    
+    
+    def _reset_model_weights_except(self) -> None:
+        """Reset model weights from snapshot, excluding specified keys."""
+        # Clear cache before reset
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.empty_cache()
+        
+        snap_sd = self._reset_snapshot["pipeline"]  # CPU snapshot
+        cur_sd = self.pipeline.module.state_dict() if hasattr(self.pipeline, "module") else self.pipeline.state_dict()
+
+        for k, v in snap_sd.items():
+            if any(s in k for s in self.config._reset_exclude_key_substrings):
+                continue  # keep current (camera) params
+            cur_sd[k] = v  # restore everything else
+
+        del snap_sd
+        gc.collect()
+        torch.cuda.empty_cache()
+        if hasattr(self.pipeline, "module"):
+            self.pipeline.module.load_state_dict(cur_sd, strict=True)
+        else:
+            self.pipeline.load_state_dict(cur_sd, strict=True)
+
+        # Clean up
+        del cur_sd
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+    def _reset_model_and_optimizers(self) -> None:
+        """Reset model and optimizers to initial snapshot state."""
+
+        # 1) Drop old objects
+        del self.optimizers
+
+        # If you kept extra references elsewhere, clear those too.
+
+        # 2) Force Python to collect old CPU objects
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Reset model weights (excluding camera optimizer params)
+        self._reset_model_weights_except()
+
+        # Reinit optimizers
+        self.optimizers = self.setup_optimizers()
+        
+        # Load snapshot states into the NEW objects
+        for k, opt in self.optimizers.optimizers.items():
+            opt.load_state_dict(copy.deepcopy(self._reset_snapshot["optimizers"][k]))
+            self._move_optimizer_state_to_device(opt, self.device)
+
+        for k, sch in self.optimizers.schedulers.items():
+            sch.load_state_dict(copy.deepcopy(self._reset_snapshot["schedulers"][k]))
+
+        # Reset grad scaler
+        self.grad_scaler.load_state_dict(copy.deepcopy(self._reset_snapshot["scaler"]))
+
+
+        # Clear any leftover grads
+        for opt in self.optimizers.optimizers.values():
+            opt.zero_grad(set_to_none=True)
+
+        # Reset trackers
+        self.early_stopping_tracker.best = None
+        self.early_stopping_tracker.latest = None
+        self.checkpoint_saving_tracker.best = None
+        self.checkpoint_saving_tracker.latest = None
+            
+    
     def setup(self, test_mode: Literal["test", "val", "inference"] = "val") -> None:
         """Setup the Trainer by calling other setup functions.
 
@@ -217,6 +370,8 @@ class Trainer:
         self.optimizers = self.setup_optimizers()
         self._load_checkpoint()  # load checkpoint before setting up optimizers in case parameters are re-registered
         
+
+        self._reset_snapshot = self._capture_reset_snapshot()
 
         # set up viewer if enabled
         viewer_log_path = self.base_dir / self.config.viewer.relative_log_filename
@@ -274,7 +429,6 @@ class Trainer:
 
     def setup_optimizers(self) -> Optimizers:
         """Helper to set up the optimizers
-
         Returns:
             The optimizers object given the trainer config.
         """
@@ -295,24 +449,65 @@ class Trainer:
         self._init_viewer_state()
         with TimeWriter(writer, EventName.TOTAL_TRAIN_TIME):
             num_iterations = self.config.max_num_iterations
-            step = 0
+            # step = 0
             start_time = time.time()
             for step in range(self._start_step, self._start_step + num_iterations):
+
                 while self.training_state == "paused":
                     time.sleep(0.01)
+                
+                if self.config.reset_at_steps is not None and step in self.config.reset_at_steps:
+                     with self.train_lock:  # important (viewer/eval might access the pipeline)
+                        CONSOLE.log(f"[yellow]Resetting model+optimizer states at step {step}[/yellow]")
+                        
+                        # Switch to eval mode to reduce memory usage
+                        was_training = self.pipeline.training
+                        self.pipeline.eval()
+                        
+                        # Clear all gradients and cache before reset
+                        for opt in self.optimizers.optimizers.values():
+                            opt.zero_grad(set_to_none=True)
+                        
+                        # Force Python garbage collection
+                        gc.collect()
+                        
+                        # Clear CUDA cache with synchronization
+                        if "cuda" in self.device:
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        
+                        # Perform reset
+                        self._reset_model_and_optimizers()
+                        
+                        # Clear memory after reset
+                        gc.collect()
+                        if "cuda" in self.device:
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        
+                        # Switch back to train mode if it was training
+                        if was_training:
+                            self.pipeline.train()
+                            time.sleep(2)
+                        
+                        # Skip one iteration to allow memory to stabilize
+                        continue
+                        
+                        # self.pipeline.datamanager.update_dataset_resolution(self.config.camera_res_scale_factor_at_reset[self.config.reset_at_steps.index(step)])
                 with self.train_lock:
                     with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
+                        
                         self.pipeline.train()
-
+                        
                         # training callbacks before the training iteration
                         for callback in self.callbacks:
                             callback.run_callback_at_location(
                                 step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION
                             )
-
+                        
                         # time the forward pass
-                        loss, loss_dict, metrics_dict = self.train_iteration(step)
-
+                        loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.train_iteration(step)
+                        
                         # training callbacks after the training iteration
                         for callback in self.callbacks:
                             callback.run_callback_at_location(
@@ -331,7 +526,11 @@ class Trainer:
                     )
 
                 self._update_viewer_state(step)
-
+                for i in range(len(camera_xyz)):
+                    writer.record_xyz(name=f"Camera Position {i}", xyz=camera_xyz[i], step=step)
+                    writer.record_xyz(name=f"train/xyz_gt {i}", xyz=camera_xyz_gt[i], step=step)
+                    diff = (camera_xyz[i].detach().cpu() - camera_xyz_gt[i].detach().cpu())
+                    writer.put_scalar(name=f"train/xyz_l2_error {i}", scalar=float(diff.norm().cpu()), step=step)
                 # a batch of train rays
                 if step_check(step, self.config.logging.steps_per_log, run_at_zero=True):
                     writer.put_scalar(name="Train Loss", scalar=loss, step=step)
@@ -345,6 +544,7 @@ class Trainer:
                     writer.put_scalar(
                         name="GPU Memory (MB)", scalar=torch.cuda.max_memory_allocated() / (1024**2), step=step
                     )
+                
 
                 # Do not perform evaluation if there are no validation images
                 if self.pipeline.datamanager.eval_dataset:
@@ -359,6 +559,10 @@ class Trainer:
                     self.save_checkpoint(step)
 
                 writer.write_out_storage()
+
+                if step % 100 == 0:
+                    for i in range(len(camera_xyz)):
+                        writer.put_xyz_trajectory_plots(name=f"Camera Position {i}", gt_name=f"train/xyz_gt {i}", step=step)
             
         end_time = time.time()
         # save checkpoint at the end of training
@@ -471,12 +675,14 @@ class Trainer:
                 # NOTE: this is specific to the checkpoint name format
                 load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
             load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
+
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
             loaded_state = torch.load(load_path, map_location="cpu")
             loaded_state["step"] = (
                 self.config.training_start_step if self.config.training_start_step is not None else loaded_state["step"]
             )
             self._start_step = loaded_state["step"] + 1
+            
             # load the checkpoints for pipeline, optimizers, and gradient scalar
             self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
             if self.config.load_optimizer:
@@ -546,7 +752,8 @@ class Trainer:
         Args:
             step: Current training step.
         """
-
+        alternate_components = ["device_indicator_param", "dynamic_actors", "field", 
+                                "appearance_embedding", "rgb_decoder", "lidar_decoder", "proposal_fields"]
         needs_zero = [
             group for group in self.optimizers.parameters.keys() if step % self.gradient_accumulation_steps[group] == 0
         ]
@@ -554,17 +761,30 @@ class Trainer:
         cpu_or_cuda_str: str = self.device.split(":")[0]
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
 
+        if self.pipeline.config.model.skip_alternate_indices_for_model:
+            self.mask_alternate_indices_for_model = not self.mask_alternate_indices_for_model
+            if not self.mask_alternate_indices_for_model:
+                for name, p in self.pipeline.model.named_parameters():
+                    for key in alternate_components:
+                        if key in name:
+                            p.requires_grad_(False)
+
         with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
-            _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
+            _, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt = self.pipeline.get_train_loss_dict(step=step, mask_alternate_indices_for_model=self.mask_alternate_indices_for_model)
             loss = functools.reduce(torch.add, loss_dict.values())
+            
+            
+        # Clean intermediate tensors before backward pass
         self.grad_scaler.scale(loss).backward()  # type: ignore
+            
+
         needs_step = [
             group
             for group in self.optimizers.parameters.keys()
             if step % self.gradient_accumulation_steps[group] == self.gradient_accumulation_steps[group] - 1
         ]
         self.optimizers.optimizer_scaler_step_some(self.grad_scaler, needs_step)
-
+        
         if self.config.log_gradients:
             total_grad = 0
             for tag, value in self.pipeline.model.named_parameters():
@@ -581,9 +801,16 @@ class Trainer:
         # If the gradient scaler is decreased, no optimization step is performed so we should not step the scheduler.
         if scale <= self.grad_scaler.get_scale():
             self.optimizers.scheduler_step_all(step)
-
+            
+        if self.pipeline.config.model.skip_alternate_indices_for_model:
+            if not self.mask_alternate_indices_for_model:
+                for name, p in self.pipeline.model.named_parameters():
+                    for key in alternate_components:
+                        if key in name:
+                            p.requires_grad_(True)
+    
         # Merging loss and metrics dict into a single output.
-        return loss, loss_dict, metrics_dict  # type: ignore
+        return loss, loss_dict, metrics_dict, camera_xyz, camera_xyz_gt  # type: ignore
 
     @check_eval_enabled
     @profiler.time_function
@@ -634,3 +861,53 @@ class Trainer:
 def detach_items_if_tensor(dict):
     """Detach items in dictionary if they are tensors"""
     return {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in dict.items()}
+
+
+def grad_norm_per_term(loss_dict, params, *, every=100, step=0, log_file=None, rank=0):
+    if step < 9180:
+        return
+    if rank != 0:   # avoid multiple processes writing to same file
+        return
+
+    params = [p for p in params if p.requires_grad]
+
+    rows = []
+    t = time.time()
+
+    for name, term in loss_dict.items():
+        if term is None:
+            continue
+
+        grads = torch.autograd.grad(
+            term,
+            params,
+            retain_graph=True,
+            allow_unused=True
+        )
+
+        sq_sum = 0.0
+        max_abs = 0.0
+        any_grad = False
+
+        for g in grads:
+            if g is None or g.numel() == 0:
+                continue
+            gf = g.detach().float()
+            sq_sum += gf.pow(2).sum().item()
+            max_abs = max(max_abs, gf.abs().max().item())
+            any_grad = True
+
+        if any_grad:
+            norm = sq_sum ** 0.5
+            rows.append(f"{step},{t},{name},{norm:.6e},{max_abs:.6e}")
+        else:
+            rows.append(f"{step},{t},{name},,")  # no grads
+
+    if log_file is not None:
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not log_file.exists()
+        with open(log_file, "a", buffering=1) as f:  # line-buffered
+            if new_file:
+                f.write("step,unix_time,term,grad_norm,grad_maxabs\n")
+            f.write("\n".join(rows) + "\n")

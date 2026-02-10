@@ -56,7 +56,7 @@ def get_train_eval_split_filename(image_filenames: List) -> Tuple[np.ndarray, np
     i_all = np.arange(num_images)
     i_train = []
     i_eval = []
-    for idx, basename in zip(i_all, basenames):
+    for idx, basename in zip(i_all,  basenames):
         # check the frame index
         if "train" in basename:
             i_train.append(idx)

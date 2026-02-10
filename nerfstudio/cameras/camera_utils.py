@@ -1159,3 +1159,28 @@ def fisheye624_unproject(coords: torch.Tensor, distortion_params: torch.Tensor) 
     dirs[..., 1] = -dirs[..., 1]
     dirs[..., 2] = -dirs[..., 2]
     return dirs
+
+
+
+def yaw_rotation_function(yaw_rad: float) -> Tensor:
+    """Create a rotation matrix with specified yaw angle"""
+    yaw_rotation = torch.tensor([
+        [math.cos(yaw_rad), -math.sin(yaw_rad), 0],
+        [math.sin(yaw_rad), math.cos(yaw_rad), 0],
+        [0, 0, 1]
+    ], dtype=torch.float32)
+
+    # l2cam = torch.tensor([
+    #     [-0.9998236, 0.0000400, 0.0000979],
+    #     [0.000224, 0.0001868, -1.0000977],
+    #     [0.0000950, -1.0000151, -0.0000103]
+    # ], dtype=torch.float32)
+    
+    l2cam = torch.tensor([
+        [-1, 0, 0],
+        [0, 0, -1],
+        [0, -1, 0]
+    ], dtype=torch.float32)
+
+    return l2cam @ yaw_rotation
+

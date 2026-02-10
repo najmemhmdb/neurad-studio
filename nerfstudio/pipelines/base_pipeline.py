@@ -297,8 +297,8 @@ class VanillaPipeline(Pipeline):
             device=device,
             grad_scaler=grad_scaler,
             seed_points=seed_pts,
-            # lidar_times=self.datamanager.train_dataset.metadata['lidars'].times,
-            # lidar2w=self.datamanager.train_dataset.metadata['lidars'].lidar_to_worlds,
+            lidar_times=self.datamanager.train_dataset.metadata['lidars'].times,
+            lidar2w=self.datamanager.train_dataset.metadata['lidars'].lidar_to_worlds,
         )
         self.model.to(device)
 

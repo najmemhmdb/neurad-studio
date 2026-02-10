@@ -35,17 +35,26 @@
       "justMyCode": true,
       "args": [
         "neurad",
+        // "--load-scheduler=True",
+        // "--load-optimizer=True",
+        // "--load-dir=./outputs/unnamed/neurad/2025-12-20_120922/nerfstudio_models",  
+        // "--load-step=14000",
+        // "--training_start_step=14000",
+        // "--max_num_iterations=5000",
+        // "--steps-per-eval-batch=10000",
+        // "--steps-per-eval-all-images=10000",
         "--pipeline.model.eval_num_rays_per_chunk=2048",
         "--pipeline.datamanager.num_processes=0",
         "--pipeline.datamanager.train-num-lidar-rays-per-batch=1280",
         "--pipeline.datamanager.eval-num-lidar-rays-per-batch=128",
         "--pipeline.datamanager.train_num_rays_per_batch=4096",
         "--pipeline.datamanager.eval_num_rays_per_batch=4096",
-        // "--pipeline.model.camera-optimizer.mode=SO3xR3",
-        "simulator-data",
-        "--data=./data/Simulator_1Nov2025",
+        "--pipeline.model.camera-optimizer.mode=SE3",
+        "pandaset-data",
+        "--data=./data/pandaset",
         "--dataset_end_fraction=1.0",
-        "--cameras=all"
+        "--cameras=all",
+        "--sequence=028"
       ]
     },
     {

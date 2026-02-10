@@ -75,29 +75,63 @@ class ADPipeline(VanillaPipeline):
         self.fid = None
 
     @profiler.time_function
-    def get_train_loss_dict(self, step: int):
+    def get_train_loss_dict(self, step: int, mask_alternate_indices_for_model: bool):
         """This function gets your training loss dict. This will be responsible for
         getting the next batch of data from the DataManager and interfacing with the
         Model class, feeding the data to the model's forward function.
 
         Args:
             step: current iteration step to update sampler if using DDP (distributed)
+            mask_alternate_indices_for_model: whether to mask alternate indices for model
         """
         # Regular forward pass and loss calc
         ray_bundle, batch = self.datamanager.next_train(step)
         model_outputs = self._model(ray_bundle, patch_size=self.config.ray_patch_size)
         metrics_dict = self.model.get_metrics_dict(model_outputs, batch)
-
         if (actors := self.model.dynamic_actors).config.optimize_trajectories:
             pos_norm = (actors.actor_positions - actors.initial_positions).norm(dim=-1)
             metrics_dict["traj_opt_translation"] = pos_norm[pos_norm > 0].mean().nan_to_num()
             metrics_dict["traj_opt_rotation"] = (
                 (actors.actor_rotations_6d - actors.initial_rotations_6d)[pos_norm > 0].norm(dim=-1).mean().nan_to_num()
             )
+        if not mask_alternate_indices_for_model:
+            # Compute losses for ALL rays (will be used for camera optimizer)
+            loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
+        else:
+            model_gradient_mask = self._compute_model_loss_mask(ray_bundle, batch)
+            # Compute losses for MASKED rays only (will be used for model)
+            loss_dict = self.model.get_loss_dict(
+                model_outputs, batch, metrics_dict, 
+                model_gradient_mask=model_gradient_mask
+            )
 
-        loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict)
+        return model_outputs, loss_dict, metrics_dict, self.model.camera_optimizer.extrinsics_trans.clone(), self.model.camera_optimizer.ext_init.clone()[:,:3]
 
-        return model_outputs, loss_dict, metrics_dict
+    def _compute_model_loss_mask(self, ray_bundle, batch):
+        """Compute mask indicating which rays should contribute gradients to model weights."""
+        num_img_cameras = len(self.datamanager.train_dataset.cameras)
+        
+        if ray_bundle.camera_indices is None:
+            return None
+        
+        camera_indices = ray_bundle.camera_indices.squeeze(-1)
+        is_lidar = batch.get("is_lidar", torch.zeros(len(camera_indices), 1, dtype=torch.bool, device=camera_indices.device)).squeeze(-1)
+        
+        model_gradient_mask = torch.ones(len(camera_indices), dtype=torch.bool, device=camera_indices.device)
+        
+        camera_mask = ~is_lidar
+        lidar_mask = is_lidar
+        
+        if camera_mask.any():
+            camera_idx_values = camera_indices[camera_mask]
+            camera_alternate_mask = (camera_idx_values % 2 == 1)
+            model_gradient_mask[camera_mask] = ~camera_alternate_mask
+        
+        if lidar_mask.any():
+            lidar_idx_values = camera_indices[lidar_mask] - num_img_cameras
+            lidar_alternate_mask = (lidar_idx_values % 2 == 1)
+            model_gradient_mask[lidar_mask] = ~lidar_alternate_mask
+    
 
     @profiler.time_function
     def get_eval_loss_dict(self, step: int):
