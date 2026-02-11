@@ -453,8 +453,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             sensor2lidar_list_gt.append(mat4_to_SO3xR3_twist(sensor2lidar[:3, :]))
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            # yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
-            # l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
+            yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
+            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
             sensor2l_4x4_noisy = np.linalg.inv(l2sensor_4x4_noisy)
             sensor2l_4x4_noisy[:3, 3] = 0
             sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy)
@@ -495,9 +495,6 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             lidar2w_4x4 = pose_utils.to4x4(interpolated_batch_lidar2w)
 
             sensor2w = lidar2w_4x4 @ extrinsics_mapped
-            # R = sensor2w[:, :3, :3]
-            # sensor2w[:, :3, :3] = R @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).cuda().to(dtype=torch.float32)
-
             # calculate adjustment
             s2w_cameras = self.camera_to_worlds[ext_indices.cpu()].to(sensor2w.device)
             sensor2w_init = s2w_cameras.reshape(s2w_cameras.shape[0], 3, 4)
@@ -573,9 +570,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                 R = correction_matrices[:, :3, :3]
                 t = correction_matrices[:, :3, 3]
                 
-                # raybundle.origins = (torch.bmm(R, raybundle.origins[..., None]).squeeze(-1) + t).to(raybundle.origins)
-
-                raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
+                raybundle.origins = (torch.bmm(R, raybundle.origins[..., None]).squeeze(-1) + t).to(raybundle.origins)
                 raybundle.directions = (
                     torch.bmm(R, raybundle.directions[..., None])
                     .squeeze()
