@@ -94,11 +94,11 @@ class SimulatorDataParserConfig(ADDataParserConfig):
     """Simulator dataset config.
     
     Custom dataparser for simulator datasets with the following structure:
-    - point_clouds/agent_X/lidar_Y/ containing PCD files
+    - point_clouds/ containing PCD files
     - images/agent_X/camera_Y/ containing PNG images
-    - ground_truth/agent_X/camera_Y/ containing annotation files
+    - ground_truth/camera_Y/ containing annotation files
     - labels/sensor_parameters.json with sensor intrinsics/extrinsics
-    - labels/label_nerf_sample.json with OpenLabel annotations
+    - labels/label_OpenLABEL_style.json with OpenLabel annotations
     """
 
     _target: Type = field(default_factory=lambda: SimulatorDataParser)
@@ -110,7 +110,7 @@ class SimulatorDataParserConfig(ADDataParserConfig):
     """Start frame"""
     end_frame: Optional[int] = None
     """End frame"""
-    agent_id: str = "agent_1"
+    agent_id: str = "vehicle_10010"
     """ID of the agent to load."""
     is_undistorted: bool = True
     """Whether the images are undistorted."""
@@ -131,11 +131,7 @@ class SimulatorDataParserConfig(ADDataParserConfig):
     """The time offset for the center pixel, relative to the image timestamp (seconds)."""
     stationary_displacement_threshold: float = STATIONARY_DISPLACEMENT_THRESHOLD
     """Minimum translation (m) for an actor to be considered dynamic."""
-    # distortion_params: Optional[List[float]]  = field(
-    #     default_factory=lambda: [
-    #         0.00343299, -0.01468419,  0.24592364, -0.00815786
-    #     ]
-    # )
+
     """The distortion parameters for the cameras."""
     def __post_init__(self):
         """Validate that at least one camera and one lidar are specified."""
@@ -171,8 +167,9 @@ class SimulatorDataParser(ADDataParser):
         super().__init__(config)
         self.data_dir = Path(config.data)
         self.agent_id = config.agent_id
-        self.label_file = self.data_dir / "labels" / "label_nerf_sample.json"
-        self.sensor_params_file = self.data_dir / "labels" / "sensor_parameters.json" if  not config.is_undistorted else self.data_dir / "labels" / "sensor_parameters_undistorted.json"
+        self.label_file = self.data_dir / "labels" / "label_OpenLABEL_style.json"
+        # self.sensor_params_file = self.data_dir / "labels" / "sensor_parameters.json" if  not config.is_undistorted else self.data_dir / "labels" / "sensor_parameters_undistorted.json"
+        self.sensor_params_file = self.data_dir / "labels" / "label_OpenLABEL_style.json"
         self.ego_object_id = EGO_OBJECT_ID
         self.stationary_displacement_threshold = config.stationary_displacement_threshold
         
@@ -180,13 +177,12 @@ class SimulatorDataParser(ADDataParser):
         if not self.sensor_params_file.exists():
             raise ValueError(f"Sensor parameters file not found at {self.sensor_params_file}")
         with open(self.sensor_params_file, "r") as f:
-            self.sensor_params = json.load(f)
+            self.sensor_params = json.load(f).get("openlabel").get("streams")
         
         # Handle "all" for cameras
         if "all" in config.cameras:
             # Get all available cameras from sensor params
-            agent_sensors = self.sensor_params.get(self.agent_id, {})
-            available_cameras = [k for k in agent_sensors.keys() if k.startswith("camera_")]
+            available_cameras = [k for k in agent_sensors.keys() if "camera_" in k]
             if not available_cameras:
                 raise ValueError("No cameras available. Check sensor_parameters.json or camera configuration.")
             self.config.cameras = tuple(available_cameras)
