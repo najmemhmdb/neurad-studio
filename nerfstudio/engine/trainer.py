@@ -777,6 +777,10 @@ class Trainer:
         # Clean intermediate tensors before backward pass
         self.grad_scaler.scale(loss).backward()  # type: ignore
             
+        # if (step // 500) % 2 == 0:
+        #     self.optimizers.optimizers['camera_opt_trans'].zero_grad()
+        # if (step // 500) % 2 == 1:
+        #     self.optimizers.optimizers['camera_opt_rot'].zero_grad()
 
         needs_step = [
             group

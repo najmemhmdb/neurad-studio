@@ -416,6 +416,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
         self.offsets = torch.nn.Parameter(torch.tensor([[0.0], [-0.010797], [0.010783], [-0.050045], [-0.031357], [0.03129]]).to(device))
         self.offsets.requires_grad_(False)
+        # self.extrinsics_trans.requires_grad_(False)
+        # self.extrinsics_rot.requires_grad_(False)
         self.lidar2w = kwargs["lidar2w"].cuda()
         self.camera_to_worlds = torch.zeros((self.camera_count*self.sequence_length, 12), device=self.device)
         self.lidar_times = kwargs["lidar_times"].cuda()
@@ -453,8 +455,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             sensor2lidar_list_gt.append(mat4_to_SO3xR3_twist(sensor2lidar[:3, :]))
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
-            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
+            # yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
+            # l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
             sensor2l_4x4_noisy = np.linalg.inv(l2sensor_4x4_noisy)
             sensor2l_4x4_noisy[:3, 3] = 0
             sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy)
@@ -482,16 +484,16 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             extrinsics = ext_adjustments[camera_indices]
             camera_offsets = time_offsets[camera_indices] 
             seq_indices = ext_indices % self.sequence_length  #[batch size]
-            query_times = self.lidar_times[seq_indices] + camera_offsets
+            # query_times = self.lidar_times[seq_indices] + camera_offsets
             
             extrinsics_mapped = pose_utils.to4x4(exp_map_SO3xR3(extrinsics))
             
-            interpolated_batch_lidar2w = pose_utils.vectorized_interpolate(
-                                            self.lidar2w, self.lidar_times, query_times
-                                        )
+            # interpolated_batch_lidar2w = pose_utils.vectorized_interpolate(
+            #                                 self.lidar2w, self.lidar_times, query_times
+            #                             )
 
 
-            # interpolated_batch_lidar2w = self.lidar2w[seq_indices]
+            interpolated_batch_lidar2w = self.lidar2w[seq_indices]
             lidar2w_4x4 = pose_utils.to4x4(interpolated_batch_lidar2w)
 
             sensor2w = lidar2w_4x4 @ extrinsics_mapped
@@ -569,7 +571,6 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                 correction_matrices = self(raybundle.camera_indices.squeeze())
                 R = correction_matrices[:, :3, :3]
                 t = correction_matrices[:, :3, 3]
-                
                 raybundle.origins = (torch.bmm(R, raybundle.origins[..., None]).squeeze(-1) + t).to(raybundle.origins)
                 raybundle.directions = (
                     torch.bmm(R, raybundle.directions[..., None])
