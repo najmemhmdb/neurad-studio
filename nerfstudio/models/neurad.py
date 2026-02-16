@@ -71,7 +71,7 @@ class LossSettings:
 
     vgg_mult: float = 0.05
     """Multipier for VGG perceptual loss."""
-    rgb_mult: float = 5.0
+    rgb_mult: float = 1
     """Multipier for RGB loss."""
     depth_mult: float = 0.01
     """Multipier for lidar loss."""
@@ -95,7 +95,7 @@ class LossSettings:
     """Multiplier for the ray drop loss."""
     prop_lidar_loss_mult: float = 0.1
     """Multiplier for the proposal depth loss (on top of existing multiplier)."""
-    edge_mult: float = 1.0
+    edge_mult: float = 0.0
     """Multiplier for the edge loss."""
     edge_mult_v: float = 1.0
     """Multiplier for the edge loss vertical."""
@@ -280,8 +280,9 @@ class NeuRADModel(ADModel):
         self.rmse = lambda pred, gt: torch.sqrt(torch.mean((pred - gt) ** 2))
         self.chamfer_distance = lambda pred, gt: chamfer_distance(pred, gt, 1_000, True)
         self.step = 0
-        # self.sobel_weight = SobelEdges()
-        # self.gauss = GaussianBlurDepthwise(ksize=11, sigma=2.0)
+        if self.config.loss.edge_mult > 0.0:
+            self.sobel_weight = SobelEdges()
+            self.gauss = GaussianBlurDepthwise(ksize=11, sigma=2.0)
 
     @property
     def fields(self) -> list[Union[NeuRADField, NeuRADProposalField]]:
@@ -604,6 +605,8 @@ class NeuRADModel(ADModel):
         self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
 
+
+
     def get_loss_dict(self, outputs, batch, metrics_dict=None, model_gradient_mask=None, patch_size=None):
         """Get loss dictionary with optional gradient masking.
         
@@ -633,43 +636,38 @@ class NeuRADModel(ADModel):
                     loss_dict["rgb_loss"] = self.rgb_loss(masked_image, masked_rgb) * conf.rgb_mult
                     if conf.vgg_mult > 0.0:
                         loss_dict["vgg_loss"] = self.vgg_loss(masked_rgb, masked_image) * conf.vgg_mult
+                    if conf.edge_mult > 0.0:
+                        loss, lv, lh, _, _= self.edge_weighted_charbonnier_vh_fast(masked_rgb.permute(0,3,1,2).contiguous(),
+                                                                        masked_image.permute(0,3,1,2).contiguous().to(self.device),
+                                                                        coef_v=conf.edge_mult_v, coef_h=conf.edge_mult_h, return_parts=True)
+                        loss_dict["edge_loss"] = loss * conf.edge_mult
+                        loss_dict["edge_loss_vertical"] = lv * conf.edge_mult_v
+                        loss_dict["edge_loss_horizontal"] = lh * conf.edge_mult_h 
                 else:
                     loss_dict["rgb_loss"] = torch.tensor(0.0, device=rgb.device)
                     if conf.vgg_mult > 0.0:
                         loss_dict["vgg_loss"] = torch.tensor(0.0, device=rgb.device)
+                    if conf.edge_mult > 0.0:
+                        loss, lv, lh, _, _= self.edge_weighted_charbonnier_vh_fast(rgb.permute(0,3,1,2).contiguous(),
+                                                                        image.permute(0,3,1,2).contiguous().to(self.device),
+                                                                        coef_v=conf.edge_mult_v, coef_h=conf.edge_mult_h, return_parts=True)
+                        loss_dict["edge_loss"] = loss * conf.edge_mult
+                        loss_dict["edge_loss_vertical"] = lv * conf.edge_mult_v
+                        loss_dict["edge_loss_horizontal"] = lh * conf.edge_mult_h 
             else:
                 loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult
                 if conf.vgg_mult > 0.0:
                     loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
 
+                if conf.edge_mult > 0.0:
+                    loss, lv, lh, _, _= self.edge_weighted_charbonnier_vh_fast(rgb.permute(0,3,1,2).contiguous(),
+                                                                     image.permute(0,3,1,2).contiguous().to(self.device),
+                                                                     coef_v=conf.edge_mult_v, coef_h=conf.edge_mult_h, return_parts=True) 
+                    loss_dict["edge_loss"] = loss * conf.edge_mult
+                    loss_dict["edge_loss_vertical"] = lv * conf.edge_mult_v
+                    loss_dict["edge_loss_horizontal"] = lh * conf.edge_mult_h
 
-
-
-
-
-            # loss_dict["rgb_loss"] = self.rgb_loss(image, rgb) * conf.rgb_mult 
-            # if conf.vgg_mult > 0.0:
-            #     loss_dict["vgg_loss"] = self.vgg_loss(rgb, image) * conf.vgg_mult
-            # # if conf.edge_mult > 0.0:
-            #     loss, lv, lh, _, _= self.edge_weighted_charbonnier_vh_fast(rgb.permute(0,3,1,2).contiguous(),
-            #                                                          image.permute(0,3,1,2).contiguous().to(self.device),
-            #                                                          coef_v=conf.edge_mult_v, coef_h=conf.edge_mult_h, return_parts=True)
-            #     loss_dict["edge_loss"] = loss * conf.edge_mult
-            #     loss_dict["edge_loss_vertical"] = lv * conf.edge_mult_v
-            #     loss_dict["edge_loss_horizontal"] = lh * conf.edge_mult_h
         if self.training:
-            # if "weights_list" in outputs:
-            #     loss_dict["interlevel_loss"] = self.config.loss.interlevel_loss_mult * self.interlevel_loss(
-            #         outputs["weights_list"], outputs["ray_samples_list"]
-            #     )
-            #     assert metrics_dict is not None and "distortion" in metrics_dict
-            #     loss_dict["distortion_loss"] = self.config.loss.distortion_loss_mult * metrics_dict["distortion"]
-            #     prop_depth_mult = conf.prop_lidar_loss_mult * conf.depth_mult
-            #     prop_carv_mult = conf.prop_lidar_loss_mult * conf.carving_mult
-            #     for i_prop in range(self.config.num_proposal_rounds):
-            #         loss_dict[f"depth_loss_{i_prop}"] =  prop_depth_mult * metrics_dict[f"depth_loss_{i_prop}"]
-            #         loss_dict[f"carving_loss_{i_prop}"] = prop_carv_mult * metrics_dict[f"carving_loss_{i_prop}"]
-
             if "weights_list" in outputs:
                 # Apply mask to weights_list if provided
                 if model_gradient_mask is not None:
@@ -723,10 +721,11 @@ class NeuRADModel(ADModel):
             image, rgb = batch["image"].to(self.device), outputs["rgb"]
             images_dict["img"] = torch.cat([image, rgb], dim=1)
             images_dict["depth"] = colormaps.apply_depth_colormap(outputs["depth"])
-            # loss, lv, lh, wv, wh = self.edge_weighted_charbonnier_vh_fast(outputs["rgb"].permute(2,0,1).unsqueeze(0).contiguous(),
-            #                                                          batch["image"].permute(2,0,1).to(self.device).unsqueeze(0).contiguous(),
-            #                                                          coef_v=2.0, coef_h=1.0, return_parts=True)
-            # images_dict["edge"] = torch.cat([wv.squeeze(0).permute(1,2,0), wh.squeeze(0).permute(1,2,0)], dim=1)
+            if self.config.loss.edge_mult > 0.0:
+                loss, lv, lh, wv, wh = self.edge_weighted_charbonnier_vh_fast(outputs["rgb"].permute(2,0,1).unsqueeze(0).contiguous(),
+                                                                        batch["image"].permute(2,0,1).to(self.device).unsqueeze(0).contiguous(),
+                                                                        coef_v=2.0, coef_h=1.0, return_parts=True)
+                images_dict["edge"] = torch.cat([wv.squeeze(0).permute(1,2,0), wh.squeeze(0).permute(1,2,0)], dim=1)
 
             if self.config.verbose:
                 images_dict["accumulation"] = colormaps.apply_colormap(outputs["accumulation"])
