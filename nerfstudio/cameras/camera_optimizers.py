@@ -411,8 +411,11 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         self.camera_count = 6
         self.sequence_length = num_cameras // (self.camera_count + 1)
         self.ext_init, ext_noisy = self.load_init_extrinsics() # [num_cams, 6]
-        self.extrinsics_trans = torch.nn.Parameter(ext_noisy[:, :3])  # [num_cams, 3]
-        self.extrinsics_rot   = torch.nn.Parameter(ext_noisy[:, 3:])  # [num_cams, 3]
+        self.ext_noisy = ext_noisy.to("cuda")
+        # self.extrinsics_trans = torch.nn.Parameter(ext_noisy[:, :3])  # [num_cams, 3]
+        # self.extrinsics_rot   = torch.nn.Parameter(ext_noisy[:, 3:])  # [num_cams, 3]
+        self.extrinsics_trans = torch.nn.Parameter(torch.zeros((self.camera_count, 3), device=device))
+        self.extrinsics_rot = torch.nn.Parameter(torch.zeros((self.camera_count, 3), device=device))
 
         self.offsets = torch.nn.Parameter(torch.tensor([[0.0], [-0.010797], [0.010783], [-0.050045], [-0.031357], [0.03129]]).to(device))
         self.offsets.requires_grad_(False)
@@ -450,17 +453,17 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             l2sensor_4x4 = _pandaset_pose_to_matrix(l2sensor)
             sensor2l_4x4 = np.linalg.inv(l2sensor_4x4)
             sensor2lidar = torch.from_numpy(sensor2l_4x4)
-            sensor2lidar[:3, :3] = sensor2lidar[:3, :3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
+            # sensor2lidar[:3, :3] = sensor2lidar[:3, :3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
             
             sensor2lidar_list_gt.append(mat4_to_SO3xR3_twist(sensor2lidar[:3, :]))
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            # yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
-            # l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
+            yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
+            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
             sensor2l_4x4_noisy = np.linalg.inv(l2sensor_4x4_noisy)
             sensor2l_4x4_noisy[:3, 3] = 0
             sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy)
-            sensor2lidar_noisy[:3, :3] = sensor2lidar_noisy[:3, :3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
+            # sensor2lidar_noisy[:3, :3] = sensor2lidar_noisy[:3, :3] @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to(dtype=torch.float64)
             
             sensor2lidar_list_noisy.append(mat4_to_SO3xR3_twist(sensor2lidar_noisy[:3, :]))
            
@@ -478,15 +481,17 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             self.step_counter += 1
 
             ext_adjustments = self._get_ext_adjustment()
-            time_offsets = self._get_offsets()
+            # time_offsets = self._get_offsets()
 
             camera_indices = ext_indices // self.sequence_length
             extrinsics = ext_adjustments[camera_indices]
-            camera_offsets = time_offsets[camera_indices] 
+            ext_fixed_noisy = self.ext_noisy[camera_indices]
+            # camera_offsets = time_offsets[camera_indices] 
             seq_indices = ext_indices % self.sequence_length  #[batch size]
             # query_times = self.lidar_times[seq_indices] + camera_offsets
             
             extrinsics_mapped = pose_utils.to4x4(exp_map_SO3xR3(extrinsics))
+            extrinsics_mapped_noisy = pose_utils.to4x4(exp_map_SO3xR3(ext_fixed_noisy))
             
             # interpolated_batch_lidar2w = pose_utils.vectorized_interpolate(
             #                                 self.lidar2w, self.lidar_times, query_times
@@ -496,20 +501,35 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             interpolated_batch_lidar2w = self.lidar2w[seq_indices]
             lidar2w_4x4 = pose_utils.to4x4(interpolated_batch_lidar2w)
 
-            sensor2w = lidar2w_4x4 @ extrinsics_mapped
+            # sensor2w = lidar2w_4x4 @ extrinsics_mapped
+            inter =  extrinsics_mapped_noisy @ extrinsics_mapped
+            sensor2w = lidar2w_4x4 @ inter
+
+            R = sensor2w[:, :3, :3] 
+            sensor2w[:, :3, :3] = R @ torch.from_numpy(OPENCV_TO_NERFSTUDIO).to('cuda').to(dtype=torch.float32)
             # calculate adjustment
             s2w_cameras = self.camera_to_worlds[ext_indices.cpu()].to(sensor2w.device)
+            all_init_filled = True
+            all_init_filled = s2w_cameras.flatten(1).any(dim=1).all()
+
+            if not all_init_filled:
+                return output_mats
+
             sensor2w_init = s2w_cameras.reshape(s2w_cameras.shape[0], 3, 4)
             init_4x4 = pose_utils.to4x4(sensor2w_init)
             adjustment = sensor2w @ torch.inverse(init_4x4) # (B,3,4)
-            output_mats[mask_ext] = adjustment[:, :3, :4]
+
+            output_mats[mask_ext] = adjustment[:, :3, :4].to(output_mats.device)
             self.adjustment = adjustment[:, :3, :4]
 
             # visualization and debug information
             with torch.no_grad():
                 camera_indices_unique = torch.unique(camera_indices.clone().detach())
                 for idx in camera_indices_unique:
-                    pred_extrinsic = exp_map_SO3xR3(torch.cat([self.extrinsics_trans[idx.item()], self.extrinsics_rot[idx.item()]]).unsqueeze(0))
+                    learned_extrinsic = pose_utils.to4x4(exp_map_SO3xR3(torch.cat([self.extrinsics_trans[idx.item()], self.extrinsics_rot[idx.item()]]).unsqueeze(0))) 
+                    extrinsics_noisy = pose_utils.to4x4(exp_map_SO3xR3(torch.cat([self.ext_noisy[idx.item()][:3], self.ext_noisy[idx.item()][3:]]).unsqueeze(0))) 
+                    pred_extrinsic = extrinsics_noisy @ learned_extrinsic
+
                     gt_extrinsic = exp_map_SO3xR3(self.ext_init[idx.item()].unsqueeze(0))
 
                     self.errors[idx.item()]['x'].append([self.step_counter, gt_extrinsic[0, 0, 3].item() - pred_extrinsic[0, 0, 3].item()])
@@ -630,6 +650,15 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         else:
             assert len(camera_opt_params) == 0
 
+    
+    def get_total_extrinsics(self) -> Float[Tensor, "num_cameras 3 4"]:
+        """Get the total extrinsics."""
+        learned_extrinsic = pose_utils.to4x4(exp_map_SO3xR3(torch.cat([self.extrinsics_trans, self.extrinsics_rot], dim=-1))) 
+        extrinsics_noisy = pose_utils.to4x4(exp_map_SO3xR3(torch.cat([self.ext_noisy[:, :3], self.ext_noisy[:, 3:]], dim=-1))) 
+        pred_extrinsic = extrinsics_noisy @ learned_extrinsic
+        return pred_extrinsic[:, :3, 3]
+        
+
 
 @dataclass
 class ScaledCameraOptimizerConfig(CameraOptimizerConfig):
@@ -676,6 +705,8 @@ class ScaledCameraOptimizer(CameraOptimizer):
             ).mean() + pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
 
 
+
+   
 
 
 def rotation_matrix_difference_angle_trace(R1, R2):
