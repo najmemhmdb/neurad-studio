@@ -627,11 +627,11 @@ class Trainer:
         """
         assert self.viewer_state is not None
         num_rays_per_batch: int = self.pipeline.datamanager.get_train_rays_per_batch()
-        try:
-            self.viewer_state.update_scene(step, num_rays_per_batch)
-        except RuntimeError:
-            time.sleep(0.03)  # sleep to allow buffer to reset
-            CONSOLE.log("Viewer failed. Continuing training.")
+        # try:
+        self.viewer_state.update_scene(step, num_rays_per_batch)
+        # except RuntimeError:
+        #     time.sleep(0.03)  # sleep to allow buffer to reset
+        #     CONSOLE.log("Viewer failed. Continuing training.")
 
     @check_viewer_enabled
     def _train_complete_viewer(self) -> None:
@@ -777,9 +777,8 @@ class Trainer:
         # Clean intermediate tensors before backward pass
         self.grad_scaler.scale(loss).backward()  # type: ignore
             
-        # if (step // 500) % 2 == 0:
+        # if (step // 4000) == 0:
         #     self.optimizers.optimizers['camera_opt_trans'].zero_grad()
-        # if (step // 500) % 2 == 1:
         #     self.optimizers.optimizers['camera_opt_rot'].zero_grad()
 
         needs_step = [
