@@ -105,7 +105,8 @@ class ADPipeline(VanillaPipeline):
                 model_gradient_mask=model_gradient_mask
             )
 
-        return model_outputs, loss_dict, metrics_dict, self.model.camera_optimizer.extrinsics_trans.clone(), self.model.camera_optimizer.ext_init.clone()[:,:3]
+        return model_outputs, loss_dict, metrics_dict, self.model.camera_optimizer.get_total_extrinsics(), self.model.camera_optimizer.ext_init.clone()[:,:3]
+        # return model_outputs, loss_dict, metrics_dict, torch.zeros([6, 3]), torch.zeros([6, 3])
 
     def _compute_model_loss_mask(self, ray_bundle, batch):
         """Compute mask indicating which rays should contribute gradients to model weights."""
@@ -124,13 +125,15 @@ class ADPipeline(VanillaPipeline):
         
         if camera_mask.any():
             camera_idx_values = camera_indices[camera_mask]
-            camera_alternate_mask = (camera_idx_values % 2 == 1)
+            camera_alternate_mask = (camera_idx_values % 2) != 0
             model_gradient_mask[camera_mask] = ~camera_alternate_mask
         
         if lidar_mask.any():
             lidar_idx_values = camera_indices[lidar_mask] - num_img_cameras
-            lidar_alternate_mask = (lidar_idx_values % 2 == 1)
+            lidar_alternate_mask = (lidar_idx_values % 2) != 0
             model_gradient_mask[lidar_mask] = ~lidar_alternate_mask
+        
+        return model_gradient_mask
     
 
     @profiler.time_function
