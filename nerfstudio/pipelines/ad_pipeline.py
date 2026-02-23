@@ -104,8 +104,8 @@ class ADPipeline(VanillaPipeline):
                 model_outputs, batch, metrics_dict, 
                 model_gradient_mask=model_gradient_mask
             )
-
-        return model_outputs, loss_dict, metrics_dict, self.model.camera_optimizer.get_total_extrinsics(), self.model.camera_optimizer.ext_init.clone()[:,:3]
+        return model_outputs, loss_dict, metrics_dict, self.model.camera_optimizer.extrinsics_trans.clone(), self.model.camera_optimizer.ext_init.clone()[:,:3]
+        # return model_outputs, loss_dict, metrics_dict, self.model.camera_optimizer.get_total_extrinsics(), self.model.camera_optimizer.ext_init.clone()[:,:3]
         # return model_outputs, loss_dict, metrics_dict, torch.zeros([6, 3]), torch.zeros([6, 3])
 
     def _compute_model_loss_mask(self, ray_bundle, batch):

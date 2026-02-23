@@ -71,7 +71,7 @@ class LossSettings:
 
     vgg_mult: float = 0.05
     """Multipier for VGG perceptual loss."""
-    rgb_mult: float = 1
+    rgb_mult: float = 5.0
     """Multipier for RGB loss."""
     depth_mult: float = 0.01
     """Multipier for lidar loss."""

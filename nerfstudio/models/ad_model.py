@@ -45,7 +45,7 @@ class ADModelConfig(ModelConfig):
     use_camopt_in_eval: bool = False
     """Use result of camera optimization also during evaluation. Only makes sense if trained with train_eval_split=1.0."""
 
-    skip_alternate_indices_for_model: bool = True
+    skip_alternate_indices_for_model: bool = False
     """If True, only every other camera/lidar index contributes gradients to model weight updates,
     while all indices still contribute gradients to camera optimization. Losses are computed for all rays."""
 
