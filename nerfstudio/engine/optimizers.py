@@ -214,6 +214,20 @@ class Optimizers:
             lr = scheduler.get_last_lr()[0]
             writer.put_scalar(name=f"learning_rate/{param_group_name}", scalar=lr, step=step)
 
+
+    def scheduler_step_some(self, step: int, param_groups: List[str]) -> None:
+        """Run step for all schedulers.
+
+        Args:
+            step: the current step
+        """
+        for param_group_name, scheduler in self.schedulers.items():
+            if param_group_name in param_groups:
+                scheduler.step()
+            # TODO(ethan): clean this up. why is there indexing into a list?
+            lr = scheduler.get_last_lr()[0]
+            writer.put_scalar(name=f"learning_rate/{param_group_name}", scalar=lr, step=step)
+
     def load_optimizers(self, loaded_state: Dict[str, Any]) -> None:
         """Helper to load the optimizer state from previous checkpoint
 
