@@ -951,7 +951,7 @@ class Cameras(TensorDataclass):
                 heights, rows = self.height[cam_idx], coords[..., 0:1]
                 time_offsets = (rows / heights - 0.5) * duration + self.metadata["time_to_center_pixel"][cam_idx]
 
-            # origins = origins + self.metadata["velocities"][cam_idx] * time_offsets
+            origins = origins + self.metadata["velocities"][cam_idx] * time_offsets
             times = times + time_offsets
             del metadata["rolling_shutter_time"]  # it has served its purpose
             del metadata["time_to_center_pixel"]  # it has served its purpose

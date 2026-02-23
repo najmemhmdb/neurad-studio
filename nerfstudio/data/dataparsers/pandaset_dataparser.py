@@ -208,7 +208,7 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             for camera in cameras:
                 curr_cam = self.sequence.camera[camera]
-                # interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
+                interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
                 extrinsic_l2cam = self.extrinsics[camera]
                 extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
                 extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
@@ -217,7 +217,7 @@ class PandaSet(ADDataParser):
                 
                 file_path = curr_cam._data_structure[i]
                 # pose = _pandaset_pose_to_matrix(curr_cam.poses[i])
-                # pose = self._add_noise(interpolated_l2w.squeeze(0), l2cam, angles[camera])
+                pose = self._add_noise(interpolated_l2w.squeeze(0), l2cam, angles[camera])
                 pose = self._add_noise(l2ws[i], l2cam, angles[camera])
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
 
