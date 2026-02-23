@@ -431,12 +431,12 @@ method_configs["neurad"] = TrainerConfig(
         },
 
         "camera_opt_rot": {
-            "optimizer": CustomAdamOptimizerConfig(lr=1e-4, eps=1e-15), # 1e-4
+            "optimizer": CustomAdamOptimizerConfig(lr=1e-5, eps=1e-15), # 1e-4
             "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=20001, warmup_steps=2000),
         },
 
     },
-    # gradient_accumulation_steps={"camera_opt_trans": 100, "camera_opt_rot": 100},
+    gradient_accumulation_steps={"camera_opt_trans": 50, "camera_opt_rot": 1},
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis= "viewer+tensorboard",
     logging=LoggingConfig(steps_per_log=100),
