@@ -458,8 +458,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             sensor2lidar_list_gt.append(mat4_to_SO3xR3_twist(sensor2lidar[:3, :]))
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
-            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
+            # yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
+            # l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
             sensor2l_4x4_noisy = np.linalg.inv(l2sensor_4x4_noisy)
             sensor2l_4x4_noisy[:3, 3] = 0
             sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy)
