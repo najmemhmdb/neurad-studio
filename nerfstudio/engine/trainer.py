@@ -143,9 +143,9 @@ class TrainerConfig(ExperimentConfig):
     """Optionally log gradients during training"""
     gradient_accumulation_steps: Dict[str, int] = field(default_factory=lambda: {})
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
-    reset_at_steps: List[int] = field(default_factory=lambda: [0, 2000, 4000, 6000, 8000, 10000, 12000])   # 0, 2000, 4000, 6000, 8000, 10000, 12000
+    reset_at_steps: List[int] = field(default_factory=lambda: [0])   # 0, 2000, 4000, 6000, 8000, 10000, 12000
     """Optionally specify the step to reset the model and optimizer states."""
-    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    camera_res_scale_factor_at_reset: List[float] = field(default_factory=lambda: [1.0])
     """Optionally specify the camera resolution scale factor to use at the reset steps."""
     _reset_exclude_key_substrings: List[str] = field(default_factory=lambda: ["camera_optimizer."])
     """Optionally specify the key substrings to exclude from the reset."""
@@ -754,30 +754,32 @@ class Trainer:
         """
         alternate_components = ["device_indicator_param", "dynamic_actors", "field", 
                                 "appearance_embedding", "rgb_decoder", "lidar_decoder", "proposal_fields"]
+        freeze_phases = {0:["extrinsics_rot", "extrinsics_trans"],
+                         1:[ "mlp_feature", "appearance_embedding", "rgb_decoder", "lidar_decoder"]}
+
         needs_zero = [
             group for group in self.optimizers.parameters.keys() if step % self.gradient_accumulation_steps[group] == 0
         ]
-        # frozen_step = 6000
+        frozen_step = 6000
         self.optimizers.zero_grad_some(needs_zero)
         cpu_or_cuda_str: str = self.device.split(":")[0]
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
         flag = True
-        # freeze_phases = {0:["extrinsics_rot", "extrinsics_trans"], 1:[ "mlp_feature", "appearance_embedding", "rgb_decoder", "lidar_decoder"]}
-
-        # if step == 1:
-        #     for name, p in self.pipeline.model.named_parameters():
-        #         for key in freeze_phases[0]:
-        #             if key in name:
-        #                 p.requires_grad_(False)
-        # elif step == frozen_step:
-        #     for name, p in self.pipeline.model.named_parameters():
-        #         for key in freeze_phases[1]:
-        #             if key in name:
-        #                 p.requires_grad_(False)
+        
+        if step == 1:
+            for name, p in self.pipeline.model.named_parameters():
+                for key in freeze_phases[0]:
+                    if key in name:
+                        p.requires_grad_(False)
+        elif step == frozen_step:
+            for name, p in self.pipeline.model.named_parameters():
+                for key in freeze_phases[1]:
+                    if key in name:
+                        p.requires_grad_(False)
                 
-        #         for key in freeze_phases[0]:
-        #             if key in name:
-        #                 p.requires_grad_(True)
+                for key in freeze_phases[0]:
+                    if key in name:
+                        p.requires_grad_(True)
         # elif (step // 50) % 2 == 0:
         #     for name, p in self.pipeline.model.named_parameters():
         #         for key in freeze_phases[1]:
@@ -821,9 +823,9 @@ class Trainer:
         ]
 
 
-        # if step < frozen_step:
-        #     needs_step = set(needs_step) - set(["camera_opt_trans", "camera_opt_rot"])
-        #     needs_step = list(needs_step)
+        if step < frozen_step:
+            needs_step = set(needs_step) - set(["camera_opt_trans", "camera_opt_rot"])
+            needs_step = list(needs_step)
 
         self.optimizers.optimizer_scaler_step_some(self.grad_scaler, needs_step)
         
