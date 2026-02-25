@@ -158,8 +158,8 @@ class PandaSet(ADDataParser):
 
     def _add_noise(self, l2w: np.ndarray, extrinsic_l2cam: np.ndarray, angle: int) -> np.ndarray:
         """Add noise to the poses."""
-        # yaw_new_R = yaw_rotation_function(math.radians(angle))
-        # extrinsic_l2cam[:3, :3] = yaw_new_R.cpu().numpy()
+        yaw_new_R = yaw_rotation_function(math.radians(angle))
+        extrinsic_l2cam[:3, :3] = yaw_new_R.cpu().numpy()
         extrinsic_cam2l = np.linalg.inv(extrinsic_l2cam)
         extrinsic_cam2l[:3, 3] = 0
         new_cam2w = l2w @ extrinsic_cam2l

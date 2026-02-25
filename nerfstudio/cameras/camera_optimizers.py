@@ -458,8 +458,8 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
             sensor2lidar_list_gt.append(mat4_to_SO3xR3_twist(sensor2lidar[:3, :]))
 
             l2sensor_4x4_noisy = l2sensor_4x4.copy()
-            # yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
-            # l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
+            yaw_new_R = yaw_rotation_function(math.radians(angles[sensor]))
+            l2sensor_4x4_noisy[:3, :3] = yaw_new_R.cpu().numpy()
             sensor2l_4x4_noisy = np.linalg.inv(l2sensor_4x4_noisy)
             sensor2l_4x4_noisy[:3, 3] = 0
             sensor2lidar_noisy = torch.from_numpy(sensor2l_4x4_noisy)
@@ -478,7 +478,6 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
 
             mask_ext = all_indices < (self.sequence_length * self.camera_count)
             ext_indices = all_indices[mask_ext]
-            self.step_counter += 1
 
             ext_adjustments = self._get_ext_adjustment()
             time_offsets = self._get_offsets()
@@ -574,13 +573,15 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
                     self.errors[k] = {'x': [], 'y': [], 'z': [], 'error_angle': []}
 
             return output_mats
-        else:
-            raise ValueError(f"Not implemented for {self.config.mode}")
+        if self.config.mode == "off":
+            return torch.eye(4, device=self.device)[None, :3, :4].tile(all_indices.shape[0], 1, 1)
+
             
 
     def apply_to_raybundle(self, raybundle: RayBundle) -> None:
         """Apply the pose correction to the raybundle"""
         if self.config.mode != "off":
+            self.step_counter += 1
             with torch.cuda.amp.autocast(enabled=False):
                 sensor_indices = raybundle.camera_indices.squeeze()
                 mask_ext = sensor_indices < (self.sequence_length * self.camera_count)
@@ -650,9 +651,7 @@ class CameraLidarTemporalOptimizer(CameraOptimizer):
         if self.config.mode != "off":
             param_groups["camera_opt_trans"] = [self.extrinsics_trans]
             param_groups["camera_opt_rot"]   = [self.extrinsics_rot]
-        else:
-            assert len(camera_opt_params) == 0
-
+        
     
     def get_total_extrinsics(self) -> Float[Tensor, "num_cameras 3 4"]:
         """Get the total extrinsics."""
