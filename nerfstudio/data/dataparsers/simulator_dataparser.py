@@ -97,15 +97,13 @@ class SimulatorDataParserConfig(ADDataParserConfig):
     - point_clouds/ containing PCD files
     - images/agent_X/camera_Y/ containing PNG images
     - ground_truth/camera_Y/ containing annotation files
-    - labels/sensor_parameters.json with sensor intrinsics/extrinsics
     - labels/label_OpenLABEL_style.json with OpenLabel annotations
     """
 
     _target: Type = field(default_factory=lambda: SimulatorDataParser)
     """target class to instantiate"""
-    data: Path = Path("/mnt/public/Ehsan/datasets/private/Najmeh/simulated_data/Simulator_1Nov2025")
+    data: Path = Path("data/simulated_20260202")
     """Directory specifying location of data."""
-    """Name of the sequence/scene to load."""
     start_frame: int = 1
     """Start frame"""
     end_frame: Optional[int] = None
@@ -168,16 +166,14 @@ class SimulatorDataParser(ADDataParser):
         self.data_dir = Path(config.data)
         self.agent_id = config.agent_id
         self.label_file = self.data_dir / "labels" / "label_OpenLABEL_style.json"
-        # self.sensor_params_file = self.data_dir / "labels" / "sensor_parameters.json" if  not config.is_undistorted else self.data_dir / "labels" / "sensor_parameters_undistorted.json"
-        self.sensor_params_file = self.data_dir / "labels" / "label_OpenLABEL_style.json"
         self.ego_object_id = EGO_OBJECT_ID
         self.stationary_displacement_threshold = config.stationary_displacement_threshold
         
         # Load sensor parameters first (needed for "all" cameras check)
-        if not self.sensor_params_file.exists():
-            raise ValueError(f"Sensor parameters file not found at {self.sensor_params_file}")
-        with open(self.sensor_params_file, "r") as f:
-            self.sensor_params = json.load(f).get("openlabel").get("streams")
+        if not self.label_file.exists():
+            raise ValueError(f"Label file not found at {self.sensor_params_file}")
+        with open(self.label_file, "r") as f:
+            self.label_data = json.load(f)
         
         # Handle "all" for cameras
         if "all" in config.cameras:
@@ -187,22 +183,18 @@ class SimulatorDataParser(ADDataParser):
                 raise ValueError("No cameras available. Check sensor_parameters.json or camera configuration.")
             self.config.cameras = tuple(available_cameras)
         
-        # Load label file
-        if not self.label_file.exists():
-            raise ValueError(f"Label file not found at {self.label_file}")
-        with open(self.label_file, "r") as f:
-            self.label_data = json.load(f)
         
         # Parse frames from label file
         self.frames_data = self.label_data.get("openlabel", {}).get("frames", {})
         self.streams_data = self.label_data.get("openlabel", {}).get("streams", {})
+        self.sensor_params = self.label_data.get("openlabel", {}).get("coordinate_systems", {})
         
         # Pre-compute ego poses cache for all frames
-        self._ego_poses_cache: Dict[float, np.ndarray] = {}
+        # self._ego_poses_cache: Dict[float, np.ndarray] = {}
         # Cache for ground truth files
-        self._ego_files_cache: Dict[Tuple[str, float], Dict] = {}
-        self._sensor_files_cache: Dict[Tuple[str, float], Dict] = {}
-        self._compute_ego_poses_cache()
+        # self._ego_files_cache: Dict[Tuple[str, float], Dict] = {}
+        # self._sensor_files_cache: Dict[Tuple[str, float], Dict] = {}
+        # self._compute_ego_poses_cache()
         # output_path = Path("ego_poses.json")
 
     
@@ -499,37 +491,37 @@ class SimulatorDataParser(ADDataParser):
                 continue
             
             frame_data = self.frames_data[frame_id]
+            transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
+            ego_pose_in_world = openlabel_to_matrix(transform_src_to_dst)
             for camera_id in self.config.cameras:
-                ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
 
 
                 # ego_pose_in_world, _ = cuboid_to_pose_and_dims(
                 #     self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
                 # )
-                sensor_in_ego_dict = self.sensor_params[f"{self.config.agent_id}"][f"{camera_id}"]["extrinsic"]
-                sensor_in_ego = _extrinsic_to_matrix(sensor_in_ego_dict)
+                sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{camera_id}_cs"]["pose_wrt_parent"]
+                sensor_in_ego = openlabel_to_matrix(sensor_in_ego_dict)
                 Rotation = sensor_in_ego[:3, :3]
                 Rotation = Rotation @ SIMULATOR_TO_OPENCV
                 sensor_in_ego[:3, :3] = Rotation
-                pose = ego_pose_in_world @ sensor_in_ego 
+                pose = np.linalg.inv(ego_pose_in_world) @ sensor_in_ego 
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 poses.append(pose[:3, :4])
-                intrinsic = self.sensor_params[f"{self.config.agent_id}"][f"{camera_id}"]["intrinsic"]
-                fx = intrinsic.get("fx", 600.0)
-                fy = intrinsic.get("fy", 600.0)
+                intrinsic = self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["intrinsics_custom"]["camera_parameters"]
+                fx = intrinsic.get("fx", 621.5469613259668)
+                fy = intrinsic.get("fy", 621.2686567164179)
                 cx = intrinsic.get("cx", 600.0)
                 cy = intrinsic.get("cy", 388.5)
                 intrinsic_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
                 intrinsics.append(intrinsic_matrix)
-                uri =  self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"{self.config.agent_id}/{camera_id}"]["uri"]
-                if self.config.is_undistorted:
-                    uri = Path(str(uri).replace(camera_id, f"{camera_id}_undistorted"))
+                uri =  self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"vehicle_10010/{camera_id}"]["uri"]
                 filenames.append(uri)
                 times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
                 idxs.append(cameras.index(camera_id))
-                heights.append(self.streams_data[f"{self.config.agent_id}/{camera_id}"]["stream_properties"]["height"] - (250 if camera_id == "camera_1" else 0))
-                widths.append(self.streams_data[f"{self.config.agent_id}/{camera_id}"]["stream_properties"]["width"])
-                # distortion_params.append([-0.10086563, 0.06112929, -0.04727966, 0.00974163, 0.0, 0.0])
+                heights.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["height"] - (250 if camera_id == "camera_1" else 0))
+                widths.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["height"])
+
         # Convert to tensors
         intrinsics = torch.from_numpy(np.array(intrinsics)).float()
         poses = torch.tensor(np.array(poses), dtype=torch.float32)
@@ -537,7 +529,6 @@ class SimulatorDataParser(ADDataParser):
         idxs = torch.tensor(idxs).int().unsqueeze(-1)
         heights = torch.tensor(heights).int()
         widths = torch.tensor(widths).int()
-        # distortion_params = torch.tensor(np.array(distortion_params), dtype=torch.float32)
         cameras = Cameras(
             fx=intrinsics[:, 0, 0],
             fy=intrinsics[:, 1, 1],
@@ -545,7 +536,6 @@ class SimulatorDataParser(ADDataParser):
             cy=intrinsics[:, 1, 2],
             height=heights,
             width=widths,
-            # distortion_params=distortion_params,
             camera_to_worlds=poses,
             camera_type=CameraType.PERSPECTIVE,
             times=times,
@@ -570,19 +560,23 @@ class SimulatorDataParser(ADDataParser):
             if int(frame_id) < self.config.start_frame or int(frame_id) >= end_frame:
                 continue
 
+            frame_data = self.frames_data[frame_id]
+            transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
+            ego_pose_in_world = openlabel_to_matrix(transform_src_to_dst)
             for lidar_id in self.config.lidars:
-                ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
+                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
                 # ego_pose_in_world, _ = cuboid_to_pose_and_dims(
                 #     self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
                 # )
-                sensor_in_ego_dict = self.sensor_params[f"{self.config.agent_id}"][f"{lidar_id}"]["extrinsic"]
-                sensor_in_ego = _extrinsic_to_matrix(sensor_in_ego_dict)
+                sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{lidar_id}_cs"]["pose_wrt_parent"]
+                sensor_in_ego = openlabel_to_matrix(sensor_in_ego_dict)
                 # Lidar uses same coordinate convention as world frame (X forward, Y left, Z up)
                 # No SIMULATOR_TO_OPENCV transformation needed for lidar
-                pose = ego_pose_in_world @ sensor_in_ego
+                pose = np.linalg.inv(ego_pose_in_world) @ sensor_in_ego
                 poses.append(torch.from_numpy(pose[:3, :4]).float())
                 times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
-                filenames.append(self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"{self.config.agent_id}/{lidar_id}"]["uri"].replace(".0", ""))
+                uri = self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"vehicle_10010/{lidar_id}"]["uri"]
+                filenames.append(str(uri).replace("vehicle_10010/lidar_1/velodyne_vlp_128/", ""))
                 idxs.append(list(self.config.lidars).index(lidar_id))
         
         
@@ -592,7 +586,7 @@ class SimulatorDataParser(ADDataParser):
 
         lidars = Lidars(
             lidar_to_worlds=poses[:, :3, :4],
-            lidar_type=LidarType.VELODYNE16,
+            lidar_type=LidarType.VELODYNE128,
             times=times,
             metadata={"sensor_idxs": idxs},
             horizontal_beam_divergence=HORIZONTAL_BEAM_DIVERGENCE,
@@ -795,3 +789,14 @@ def mean_pose_quaternion(poses, weights=None):
     T_mean[:3, :3] = R_mean
     T_mean[:3, 3] = t_mean
     return T_mean
+
+
+def openlabel_to_matrix(pose_dict):
+    qx, qy, qz, qw = pose_dict["quaternion"]
+    quat = pyquaternion.Quaternion(w=qw, x=qx, y=qy, z=qz)
+    rot_matrix = quat.rotation_matrix
+
+    T = np.eye(4)
+    T[:3, :3] = rot_matrix
+    T[:3, 3] = pose_dict["translation"]
+    return T
