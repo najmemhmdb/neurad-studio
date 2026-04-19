@@ -199,215 +199,215 @@ class SimulatorDataParser(ADDataParser):
 
     
 
-    def _load_ego_file(self, camera_id: str, timestamp: float) -> Optional[Dict]:
-        """Load ego file with caching."""
-        cache_key = (camera_id, timestamp)
-        if cache_key in self._ego_files_cache and self._ego_files_cache[cache_key] is not None:
-            return self._ego_files_cache[cache_key]
+    # def _load_ego_file(self, camera_id: str, timestamp: float) -> Optional[Dict]:
+    #     """Load ego file with caching."""
+    #     cache_key = (camera_id, timestamp)
+    #     if cache_key in self._ego_files_cache and self._ego_files_cache[cache_key] is not None:
+    #         return self._ego_files_cache[cache_key]
         
-        sec = int(timestamp)
-        msec = int((timestamp - sec) * 10) 
+    #     sec = int(timestamp)
+    #     msec = int((timestamp - sec) * 10) 
         
-        gt_dir = self.data_dir / "ground_truth" / self.agent_id / camera_id
-        ego_file = gt_dir / f"ego_{sec}.{msec}00000.json"
+    #     gt_dir = self.data_dir / "ground_truth" / self.agent_id / camera_id
+    #     ego_file = gt_dir / f"ego_{sec}.{msec}00000.json"
         
-        if not ego_file.exists():
-            self._ego_files_cache[cache_key] = None
-            return None
+    #     if not ego_file.exists():
+    #         self._ego_files_cache[cache_key] = None
+    #         return None
         
-        try:
-            with open(ego_file, "r") as f:
-                ego_data = json.load(f)
-            self._ego_files_cache[cache_key] = ego_data
-            return ego_data
-        except Exception:
-            self._ego_files_cache[cache_key] = None
-            return None
-    def export_ego_poses_to_json(self, output_path: Path) -> None:
-        """Export all cached ego poses to JSON file.
+    #     try:
+    #         with open(ego_file, "r") as f:
+    #             ego_data = json.load(f)
+    #         self._ego_files_cache[cache_key] = ego_data
+    #         return ego_data
+    #     except Exception:
+    #         self._ego_files_cache[cache_key] = None
+    #         return None
+    # def export_ego_poses_to_json(self, output_path: Path) -> None:
+        # """Export all cached ego poses to JSON file.
         
-        Args:
-            output_path: Path to output JSON file
-        """
-        poses_list = []
+        # Args:
+        #     output_path: Path to output JSON file
+        # """
+        # poses_list = []
         
-        # Sort by timestamp to ensure consistent ordering
-        for timestamp in sorted(self._ego_poses_cache.keys()):
-            pose = self._ego_poses_cache[timestamp]
+        # # Sort by timestamp to ensure consistent ordering
+        # for timestamp in sorted(self._ego_poses_cache.keys()):
+        #     pose = self._ego_poses_cache[timestamp]
             
-            # Extract position (translation)
-            position = {
-                "x": float(pose[0, 3]),
-                "y": float(pose[1, 3]),
-                "z": float(pose[2, 3])
-            }
+        #     # Extract position (translation)
+        #     position = {
+        #         "x": float(pose[0, 3]),
+        #         "y": float(pose[1, 3]),
+        #         "z": float(pose[2, 3])
+        #     }
             
-            # Convert rotation matrix to quaternion
-            rot_matrix = pose[:3, :3]
-            quat = pyquaternion.Quaternion(matrix=rot_matrix)
+        #     # Convert rotation matrix to quaternion
+        #     rot_matrix = pose[:3, :3]
+        #     quat = pyquaternion.Quaternion(matrix=rot_matrix)
             
-            # Format quaternion as w, x, y, z
-            heading = {
-                "w": float(quat.w),
-                "x": float(quat.x),
-                "y": float(quat.y),
-                "z": float(quat.z)
-            }
+        #     # Format quaternion as w, x, y, z
+        #     heading = {
+        #         "w": float(quat.w),
+        #         "x": float(quat.x),
+        #         "y": float(quat.y),
+        #         "z": float(quat.z)
+        #     }
             
-            poses_list.append({
-                "position": position,
-                "heading": heading
-            })
+        #     poses_list.append({
+        #         "position": position,
+        #         "heading": heading
+        #     })
         
-        # Write to JSON file
-        with open(output_path, "w") as f:
-            json.dump(poses_list, f, indent=2)
+        # # Write to JSON file
+        # with open(output_path, "w") as f:
+        #     json.dump(poses_list, f, indent=2)
         
-        print(f"Exported {len(poses_list)} ego poses to {output_path}")
+        # print(f"Exported {len(poses_list)} ego poses to {output_path}")
 
 
-    def _get_object_pose_from_ego_file(self, camera_id: str, timestamp: float, obj_id: str) -> Optional[np.ndarray]:
-        """Get object pose in ego frame from ego_*.json file."""
-        ego_data = self._load_ego_file(camera_id, timestamp)
-        if ego_data is None:
-            return None
+    # def _get_object_pose_from_ego_file(self, camera_id: str, timestamp: float, obj_id: str) -> Optional[np.ndarray]:
+    #     """Get object pose in ego frame from ego_*.json file."""
+    #     ego_data = self._load_ego_file(camera_id, timestamp)
+    #     if ego_data is None:
+    #         return None
         
-        try:
-            moving_objects = ego_data.get("moving_object", [])
-            for obj in moving_objects:
-                if obj.get("id", {}).get("value") == obj_id:
-                    bboxcoord = obj.get("bboxcoord", {})
-                    position = bboxcoord.get("position", {})
-                    orientation = bboxcoord.get("orientation", {})
+    #     try:
+    #         moving_objects = ego_data.get("moving_object", [])
+    #         for obj in moving_objects:
+    #             if obj.get("id", {}).get("value") == obj_id:
+    #                 bboxcoord = obj.get("bboxcoord", {})
+    #                 position = bboxcoord.get("position", {})
+    #                 orientation = bboxcoord.get("orientation", {})
                     
-                    x = position.get("x", 0.0)
-                    y = position.get("y", 0.0)
-                    z = position.get("z", 0.0)
-                    roll = orientation.get("roll", 0.0)
-                    pitch = orientation.get("pitch", 0.0)
-                    yaw = orientation.get("yaw", 0.0)
+    #                 x = position.get("x", 0.0)
+    #                 y = position.get("y", 0.0)
+    #                 z = position.get("z", 0.0)
+    #                 roll = orientation.get("roll", 0.0)
+    #                 pitch = orientation.get("pitch", 0.0)
+    #                 yaw = orientation.get("yaw", 0.0)
                     
-                    rot = _euler_to_rotation_matrix(roll, pitch, yaw)
-                    pose = np.eye(4)
-                    pose[:3, :3] = rot
-                    pose[:3, 3] = [x, y, z]
-                    return pose
-        except Exception:
-            pass
+    #                 rot = _euler_to_rotation_matrix(roll, pitch, yaw)
+    #                 pose = np.eye(4)
+    #                 pose[:3, :3] = rot
+    #                 pose[:3, 3] = [x, y, z]
+    #                 return pose
+    #     except Exception:
+    #         pass
         
-        return None
+    #     return None
 
-    def _load_sensor_file(self, camera_id: str, timestamp: float) -> Optional[Dict]:
-        """Load sensor file with caching."""
-        cache_key = (camera_id, timestamp)
-        if cache_key in self._sensor_files_cache:
-            return self._sensor_files_cache[cache_key]
+    # def _load_sensor_file(self, camera_id: str, timestamp: float) -> Optional[Dict]:
+    #     """Load sensor file with caching."""
+    #     cache_key = (camera_id, timestamp)
+    #     if cache_key in self._sensor_files_cache:
+    #         return self._sensor_files_cache[cache_key]
         
-        sec = int(timestamp)
-        msec = int((timestamp - sec) * 1000)
+    #     sec = int(timestamp)
+    #     msec = int((timestamp - sec) * 1000)
         
-        gt_dir = self.data_dir / "ground_truth" / self.agent_id / camera_id
-        sensor_file = gt_dir / f"sensor_{sec}.{msec}.json"
+    #     gt_dir = self.data_dir / "ground_truth" / self.agent_id / camera_id
+    #     sensor_file = gt_dir / f"sensor_{sec}.{msec}.json"
         
-        if not sensor_file.exists():
-            self._sensor_files_cache[cache_key] = None
-            return None
+    #     if not sensor_file.exists():
+    #         self._sensor_files_cache[cache_key] = None
+    #         return None
         
-        try:
-            with open(sensor_file, "r") as f:
-                sensor_data = json.load(f)
-            self._sensor_files_cache[cache_key] = sensor_data
-            return sensor_data
-        except Exception:
-            self._sensor_files_cache[cache_key] = None
-            return None
+    #     try:
+    #         with open(sensor_file, "r") as f:
+    #             sensor_data = json.load(f)
+    #         self._sensor_files_cache[cache_key] = sensor_data
+    #         return sensor_data
+    #     except Exception:
+    #         self._sensor_files_cache[cache_key] = None
+    #         return None
 
-    def _get_object_pose_from_sensor_file(self, camera_id: str, timestamp: float, obj_id: str) -> Optional[np.ndarray]:
-        """Get object pose in sensor frame from sensor_*.json file."""
-        sensor_data = self._load_sensor_file(camera_id, timestamp)
-        if sensor_data is None:
-            return None
+    # def _get_object_pose_from_sensor_file(self, camera_id: str, timestamp: float, obj_id: str) -> Optional[np.ndarray]:
+    #     """Get object pose in sensor frame from sensor_*.json file."""
+    #     sensor_data = self._load_sensor_file(camera_id, timestamp)
+    #     if sensor_data is None:
+    #         return None
         
-        try:
-            moving_objects = sensor_data.get("moving_object", [])
-            for obj in moving_objects:
-                if obj.get("id", {}).get("value") == obj_id:
-                    bboxcoord = obj.get("bboxcoord", {})
-                    position = bboxcoord.get("position", {})
-                    orientation = bboxcoord.get("orientation", {})
+    #     try:
+    #         moving_objects = sensor_data.get("moving_object", [])
+    #         for obj in moving_objects:
+    #             if obj.get("id", {}).get("value") == obj_id:
+    #                 bboxcoord = obj.get("bboxcoord", {})
+    #                 position = bboxcoord.get("position", {})
+    #                 orientation = bboxcoord.get("orientation", {})
                     
-                    x = position.get("x", 0.0)
-                    y = position.get("y", 0.0)
-                    z = position.get("z", 0.0)
-                    roll = orientation.get("roll", 0.0)
-                    pitch = orientation.get("pitch", 0.0)
-                    yaw = orientation.get("yaw", 0.0)
+    #                 x = position.get("x", 0.0)
+    #                 y = position.get("y", 0.0)
+    #                 z = position.get("z", 0.0)
+    #                 roll = orientation.get("roll", 0.0)
+    #                 pitch = orientation.get("pitch", 0.0)
+    #                 yaw = orientation.get("yaw", 0.0)
                     
-                    rot = _euler_to_rotation_matrix(roll, pitch, yaw)
-                    pose = np.eye(4)
-                    pose[:3, :3] = rot
-                    pose[:3, 3] = [x, y, z]
-                    return pose
-        except Exception:
-            pass
+    #                 rot = _euler_to_rotation_matrix(roll, pitch, yaw)
+    #                 pose = np.eye(4)
+    #                 pose[:3, :3] = rot
+    #                 pose[:3, 3] = [x, y, z]
+    #                 return pose
+    #     except Exception:
+    #         pass
         
-        return None
+    #     return None
 
-    def _get_frame_data_by_timestamp(self, timestamp: float) -> Optional[Dict]:
-        """Get frame data for a given timestamp (assumes exact match)."""
-        for frame_id, frame_data in self.frames_data.items():
-            frame_props = frame_data.get("frame_properties", {})
-            frame_ts = frame_props.get("timestamp", None)
-            if frame_ts is not None and abs(frame_ts - timestamp) < 1e-6:  # Exact match
-                return frame_data
-        return None
+    # def _get_frame_data_by_timestamp(self, timestamp: float) -> Optional[Dict]:
+    #     """Get frame data for a given timestamp (assumes exact match)."""
+    #     for frame_id, frame_data in self.frames_data.items():
+    #         frame_props = frame_data.get("frame_properties", {})
+    #         frame_ts = frame_props.get("timestamp", None)
+    #         if frame_ts is not None and abs(frame_ts - timestamp) < 1e-6:  # Exact match
+    #             return frame_data
+    #     return None
 
-    def _compute_ego_pose_from_object_poses(
-        self, timestamp: float, camera_name: str
-    ) -> Optional[np.ndarray]:
-        """Compute ego pose in world frame using object poses.
+    # def _compute_ego_pose_from_object_poses(
+    #     self, timestamp: float, camera_name: str
+    # ) -> Optional[np.ndarray]:
+    #     """Compute ego pose in world frame using object poses.
         
-        Uses: E_object_in_world = E_ego_in_world @ E_object_in_ego
-        So: E_ego_in_world = E_object_in_world @ inv(E_object_in_ego)
+    #     Uses: E_object_in_world = E_ego_in_world @ E_object_in_ego
+    #     So: E_ego_in_world = E_object_in_world @ inv(E_object_in_ego)
         
-        Uses multiple objects to get robust estimate.
-        """
-        # Get frame data for this timestamp (assumes exact match)
-        frame_data = self._get_frame_data_by_timestamp(timestamp)
-        if frame_data is None:
-            return None
+    #     Uses multiple objects to get robust estimate.
+    #     """
+    #     # Get frame data for this timestamp (assumes exact match)
+    #     frame_data = self._get_frame_data_by_timestamp(timestamp)
+    #     if frame_data is None:
+    #         return None
         
-        objects = frame_data.get("objects", {})
+    #     objects = frame_data.get("objects", {})
         
-        # Collect valid object poses for this camera
-        ego_pose_candidates = []
+    #     # Collect valid object poses for this camera
+    #     ego_pose_candidates = []
         
-        for obj_id, obj_data in objects.items():
-            # Get object pose in world frame from label file
-            cuboid = obj_data.get("object_data", {}).get("cuboid", {})
+    #     for obj_id, obj_data in objects.items():
+    #         # Get object pose in world frame from label file
+    #         cuboid = obj_data.get("object_data", {}).get("cuboid", {})
             
-            cuboid_value = cuboid.get("value", [])
-            E_object_in_world, _ = cuboid_to_pose_and_dims(cuboid_value)
+    #         cuboid_value = cuboid.get("value", [])
+    #         E_object_in_world, _ = cuboid_to_pose_and_dims(cuboid_value)
             
-            # Get object pose in ego frame
-            E_object_in_ego = self._get_object_pose_from_ego_file(camera_name, timestamp, obj_id)
+    #         # Get object pose in ego frame
+    #         E_object_in_ego = self._get_object_pose_from_ego_file(camera_name, timestamp, obj_id)
             
-            # Compute ego pose: E_ego_in_world = E_object_in_world @ inv(E_object_in_ego)
-            E_ego_in_world = E_object_in_world @ np.linalg.inv(E_object_in_ego)
-            ego_pose_candidates.append(E_ego_in_world)
+    #         # Compute ego pose: E_ego_in_world = E_object_in_world @ inv(E_object_in_ego)
+    #         E_ego_in_world = E_object_in_world @ np.linalg.inv(E_object_in_ego)
+    #         ego_pose_candidates.append(E_ego_in_world)
         
-        if len(ego_pose_candidates) == 1:
-            return ego_pose_candidates[0]
-        ego_pose_candidates = np.array(ego_pose_candidates)
-        mean_pose = mean_pose_quaternion(ego_pose_candidates)
-        return mean_pose
-        # Sanity check: verify all candidates are consistent
-        # Compare all pairs to check if they're the same (within tolerance)
-        # translation_tolerance = 0.0001  # 1cm tolerance
-        # rotation_tolerance = 0.00001  # ~0.057 degrees tolerance
+    #     if len(ego_pose_candidates) == 1:
+    #         return ego_pose_candidates[0]
+    #     ego_pose_candidates = np.array(ego_pose_candidates)
+    #     mean_pose = mean_pose_quaternion(ego_pose_candidates)
+    #     return mean_pose
+    #     # Sanity check: verify all candidates are consistent
+    #     # Compare all pairs to check if they're the same (within tolerance)
+    #     # translation_tolerance = 0.0001  # 1cm tolerance
+    #     # rotation_tolerance = 0.00001  # ~0.057 degrees tolerance
         
-        # reference_pose = ego_pose_candidates[0]
-        # all_consistent = True
+    #     # reference_pose = ego_pose_candidates[0]
+    #     # all_consistent = True
         
     #     for candidate_pose in ego_pose_candidates:
     #         # Check translation difference
@@ -433,39 +433,39 @@ class SimulatorDataParser(ADDataParser):
     #     # (The sanity check function will catch this)
     #     return reference_pose
 
-    def _compute_ego_poses_cache(self):
-        """Pre-compute and cache ego poses for all timestamps."""
-        # Collect all unique timestamps
-        timestamps = set()
-        for frame_id, frame_data in self.frames_data.items():
-            frame_props = frame_data.get("frame_properties", {})
-            timestamp = frame_props.get("timestamp", None)
-            if timestamp is not None:
-                timestamps.add(timestamp)
+    # def _compute_ego_poses_cache(self):
+    #     """Pre-compute and cache ego poses for all timestamps."""
+    #     # Collect all unique timestamps
+    #     timestamps = set()
+    #     for frame_id, frame_data in self.frames_data.items():
+    #         frame_props = frame_data.get("frame_properties", {})
+    #         timestamp = frame_props.get("timestamp", None)
+    #         if timestamp is not None:
+    #             timestamps.add(timestamp)
         
-        # For each timestamp, compute ego pose using first available camera
-        for timestamp in sorted(timestamps):
-            # Try each camera until we find one with valid data
-            ego_pose = None
-            for camera_name in self.config.cameras:
-                ego_pose = self._compute_ego_pose_from_object_poses(timestamp, camera_name)
-                if ego_pose is not None:
-                    break
+    #     # For each timestamp, compute ego pose using first available camera
+    #     for timestamp in sorted(timestamps):
+    #         # Try each camera until we find one with valid data
+    #         ego_pose = None
+    #         for camera_name in self.config.cameras:
+    #             ego_pose = self._compute_ego_pose_from_object_poses(timestamp, camera_name)
+    #             if ego_pose is not None:
+    #                 break
             
-            if ego_pose is not None:
-                self._ego_poses_cache[timestamp] = ego_pose
+    #         if ego_pose is not None:
+    #             self._ego_poses_cache[timestamp] = ego_pose
 
-    def _get_ego_pose(self, timestamp: float) -> np.ndarray:
-        """Get ego pose for given timestamp (assumes exact match)."""
-        if timestamp in self._ego_poses_cache:
-            return self._ego_poses_cache[timestamp]
+    # def _get_ego_pose(self, timestamp: float) -> np.ndarray:
+    #     """Get ego pose for given timestamp (assumes exact match)."""
+    #     if timestamp in self._ego_poses_cache:
+    #         return self._ego_poses_cache[timestamp]
         
-        # Try to find exact match (accounting for floating point precision)
-        for cached_ts in self._ego_poses_cache.keys():
-            if abs(cached_ts - timestamp) < 1e-6:
-                return self._ego_poses_cache[cached_ts]
+    #     # Try to find exact match (accounting for floating point precision)
+    #     for cached_ts in self._ego_poses_cache.keys():
+    #         if abs(cached_ts - timestamp) < 1e-6:
+    #             return self._ego_poses_cache[cached_ts]
         
-        raise ValueError(f"No ego pose available for timestamp {timestamp}")
+    #     raise ValueError(f"No ego pose available for timestamp {timestamp}")
 
     def _get_lane_shift_sign(self, sequence: str) -> Literal[-1, 1]:
         return LANE_SHIFT_SIGN.get(sequence, 1)
@@ -492,20 +492,13 @@ class SimulatorDataParser(ADDataParser):
             
             frame_data = self.frames_data[frame_id]
             transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
-            ego_pose_in_world = openlabel_to_matrix(transform_src_to_dst)
+            ego_to_world = np.linalg.inv(openlabel_to_matrix(transform_src_to_dst))
             for camera_id in self.config.cameras:
-                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
-
-
-                # ego_pose_in_world, _ = cuboid_to_pose_and_dims(
-                #     self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
-                # )
                 sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{camera_id}_cs"]["pose_wrt_parent"]
-                sensor_in_ego = openlabel_to_matrix(sensor_in_ego_dict)
-                Rotation = sensor_in_ego[:3, :3]
-                Rotation = Rotation @ SIMULATOR_TO_OPENCV
-                sensor_in_ego[:3, :3] = Rotation
-                pose = np.linalg.inv(ego_pose_in_world) @ sensor_in_ego 
+                sensor_in_ego = np.linalg.inv(openlabel_to_matrix(sensor_in_ego_dict))
+
+                sensor_in_ego[:3, :3] = sensor_in_ego[:3, :3] @ SIMULATOR_TO_OPENCV
+                pose = ego_to_world @ sensor_in_ego 
                 pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
                 poses.append(pose[:3, :4])
                 intrinsic = self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["intrinsics_custom"]["camera_parameters"]
@@ -520,7 +513,7 @@ class SimulatorDataParser(ADDataParser):
                 times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
                 idxs.append(cameras.index(camera_id))
                 heights.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["height"] - (250 if camera_id == "camera_1" else 0))
-                widths.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["height"])
+                widths.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["width"])
 
         # Convert to tensors
         intrinsics = torch.from_numpy(np.array(intrinsics)).float()
@@ -562,17 +555,11 @@ class SimulatorDataParser(ADDataParser):
 
             frame_data = self.frames_data[frame_id]
             transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
-            ego_pose_in_world = openlabel_to_matrix(transform_src_to_dst)
+            ego_to_world = np.linalg.inv(openlabel_to_matrix(transform_src_to_dst))
             for lidar_id in self.config.lidars:
-                # ego_pose_in_world = self._ego_poses_cache[self.frames_data[frame_id]["frame_properties"]["timestamp"]]
-                # ego_pose_in_world, _ = cuboid_to_pose_and_dims(
-                #     self.frames_data[frame_id]["objects"][self.ego_object_id]["object_data"]["cuboid"]["value"]
-                # )
                 sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{lidar_id}_cs"]["pose_wrt_parent"]
-                sensor_in_ego = openlabel_to_matrix(sensor_in_ego_dict)
-                # Lidar uses same coordinate convention as world frame (X forward, Y left, Z up)
-                # No SIMULATOR_TO_OPENCV transformation needed for lidar
-                pose = np.linalg.inv(ego_pose_in_world) @ sensor_in_ego
+                sensor_in_ego = np.linalg.inv(openlabel_to_matrix(sensor_in_ego_dict))
+                pose = ego_to_world @ sensor_in_ego
                 poses.append(torch.from_numpy(pose[:3, :4]).float())
                 times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
                 uri = self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"vehicle_10010/{lidar_id}"]["uri"]
@@ -711,26 +698,26 @@ def cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.n
     
     return pose, dims
 
-def _euler_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    """Convert Euler angles (roll, pitch, yaw) to rotation matrix"""
-    r = R.from_euler("xyz", [roll, pitch, yaw], degrees=False)
-    return r.as_matrix()
+# def _euler_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+#     """Convert Euler angles (roll, pitch, yaw) to rotation matrix"""
+#     r = R.from_euler("xyz", [roll, pitch, yaw], degrees=False)
+#     return r.as_matrix()
 
-def _extrinsic_to_matrix(extrinsic: Dict) -> np.ndarray:
-    """Convert extrinsic parameters (x, y, z, roll, pitch, yaw) to 4x4 transformation matrix"""
-    rel = extrinsic.get("relative", {})
-    x = rel.get("x", 0.0)
-    y = rel.get("y", 0.0)
-    z = rel.get("z", 0.0)
-    roll = rel.get("roll", 0.0)
-    pitch = rel.get("pitch", 0.0)
-    yaw = rel.get("yaw", 0.0)
+# def _extrinsic_to_matrix(extrinsic: Dict) -> np.ndarray:
+#     """Convert extrinsic parameters (x, y, z, roll, pitch, yaw) to 4x4 transformation matrix"""
+#     rel = extrinsic.get("relative", {})
+#     x = rel.get("x", 0.0)
+#     y = rel.get("y", 0.0)
+#     z = rel.get("z", 0.0)
+#     roll = rel.get("roll", 0.0)
+#     pitch = rel.get("pitch", 0.0)
+#     yaw = rel.get("yaw", 0.0)
     
-    rot = _euler_to_rotation_matrix(roll, pitch, yaw)
-    pose = np.eye(4)
-    pose[:3, :3] = rot
-    pose[:3, 3] = [x, y, z]
-    return pose
+#     rot = _euler_to_rotation_matrix(roll, pitch, yaw)
+#     pose = np.eye(4)
+#     pose[:3, :3] = rot
+#     pose[:3, 3] = [x, y, z]
+#     return pose
 
 def get_mock_timestamps(points: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
     """Get mock relative timestamps for the velodyne points."""
@@ -747,48 +734,48 @@ def get_mock_timestamps(points: npt.NDArray[np.float32]) -> npt.NDArray[np.float
 
 
 
-def mean_pose_quaternion(poses, weights=None):
-    """
-    poses: array-like, shape (N,4,4)
-    weights: optional shape (N,)
-    returns: mean pose, shape (4,4)
-    """
-    poses = np.asarray(poses, dtype=float)
-    N = poses.shape[0]
-    if weights is None:
-        weights = np.ones(N) / N
-    else:
-        weights = np.asarray(weights, dtype=float)
-        weights = weights / weights.sum()
+# def mean_pose_quaternion(poses, weights=None):
+#     """
+#     poses: array-like, shape (N,4,4)
+#     weights: optional shape (N,)
+#     returns: mean pose, shape (4,4)
+#     """
+#     poses = np.asarray(poses, dtype=float)
+#     N = poses.shape[0]
+#     if weights is None:
+#         weights = np.ones(N) / N
+#     else:
+#         weights = np.asarray(weights, dtype=float)
+#         weights = weights / weights.sum()
 
-    # --- mean translation
-    t_mean = np.sum(weights[:, None] * poses[:, :3, 3], axis=0)
+#     # --- mean translation
+#     t_mean = np.sum(weights[:, None] * poses[:, :3, 3], axis=0)
 
-    # --- mean rotation via Markley quaternion averaging (needs scipy)
-    from scipy.spatial.transform import Rotation as R
+#     # --- mean rotation via Markley quaternion averaging (needs scipy)
+#     from scipy.spatial.transform import Rotation as R
 
-    quats = R.from_matrix(poses[:, :3, :3]).as_quat()  # (x,y,z,w)
+#     quats = R.from_matrix(poses[:, :3, :3]).as_quat()  # (x,y,z,w)
 
-    # Fix sign ambiguity (q and -q are same rotation) for stability
-    q0 = quats[0]
-    for i in range(N):
-        if np.dot(quats[i], q0) < 0:
-            quats[i] = -quats[i]
+#     # Fix sign ambiguity (q and -q are same rotation) for stability
+#     q0 = quats[0]
+#     for i in range(N):
+#         if np.dot(quats[i], q0) < 0:
+#             quats[i] = -quats[i]
 
-    A = np.zeros((4, 4))
-    for w, q in zip(weights, quats):
-        A += w * np.outer(q, q)
+#     A = np.zeros((4, 4))
+#     for w, q in zip(weights, quats):
+#         A += w * np.outer(q, q)
 
-    eigvals, eigvecs = np.linalg.eigh(A)
-    q_mean = eigvecs[:, np.argmax(eigvals)]
-    q_mean /= np.linalg.norm(q_mean)
+#     eigvals, eigvecs = np.linalg.eigh(A)
+#     q_mean = eigvecs[:, np.argmax(eigvals)]
+#     q_mean /= np.linalg.norm(q_mean)
 
-    R_mean = R.from_quat(q_mean).as_matrix()
+#     R_mean = R.from_quat(q_mean).as_matrix()
 
-    T_mean = np.eye(4)
-    T_mean[:3, :3] = R_mean
-    T_mean[:3, 3] = t_mean
-    return T_mean
+#     T_mean = np.eye(4)
+#     T_mean[:3, :3] = R_mean
+#     T_mean[:3, 3] = t_mean
+#     return T_mean
 
 
 def openlabel_to_matrix(pose_dict):
