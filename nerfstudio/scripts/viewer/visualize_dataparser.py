@@ -118,7 +118,7 @@ class VisualizerConfig:
     image_thumbnail_size: int = 100
     """Size of image thumbnails displayed in camera frustums (in pixels)."""
     
-    point_size: float = 0.02
+    point_size: float = 0.005
     """Size of lidar points in the visualization."""
     
     max_points_per_cloud: Optional[int] = 50000
@@ -695,35 +695,35 @@ class DataParserVisualizer:
             "height": height,
         }
 
-        distortion_params = DEFAULT_DISTORTION_PARAMS.copy()
-        if cameras.distortion_params is not None:
-            dist_tensor = cameras.distortion_params[camera_idx]
-            if dist_tensor is not None and torch.any(dist_tensor != 0):
-                dist_np = dist_tensor.squeeze().cpu().numpy().astype(np.float32)
-                if dist_np.size >= 4:
-                    distortion_params = dist_np[:4]
+        # distortion_params = DEFAULT_DISTORTION_PARAMS.copy()
+        # if cameras.distortion_params is not None:
+        #     dist_tensor = cameras.distortion_params[camera_idx]
+        #     if dist_tensor is not None and torch.any(dist_tensor != 0):
+        #         dist_np = dist_tensor.squeeze().cpu().numpy().astype(np.float32)
+        #         if dist_np.size >= 4:
+        #             distortion_params = dist_np[:4]
 
-        if distortion_params is None or distortion_params.size < 4:
-            return image_rgb, overrides
+        # if distortion_params is None or distortion_params.size < 4:
+        return image_rgb, overrides
 
-        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
-        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        new_K, _ = cv2.getOptimalNewCameraMatrix(K, distortion_params, (width, height), 0)
-        undistorted_bgr = cv2.undistort(image_bgr, K, distortion_params, None, new_K)
-        undistorted_rgb = cv2.cvtColor(undistorted_bgr, cv2.COLOR_BGR2RGB)
+        # K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+        # image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        # new_K, _ = cv2.getOptimalNewCameraMatrix(K, distortion_params, (width, height), 0)
+        # undistorted_bgr = cv2.undistort(image_bgr, K, distortion_params, None, new_K)
+        # undistorted_rgb = cv2.cvtColor(undistorted_bgr, cv2.COLOR_BGR2RGB)
 
-        overrides.update(
-            {
-                "fx": float(new_K[0, 0]),
-                "fy": float(new_K[1, 1]),
-                "cx": float(new_K[0, 2]),
-                "cy": float(new_K[1, 2]),
-                "width": undistorted_rgb.shape[1],
-                "height": undistorted_rgb.shape[0],
-            }
-        )
+        # overrides.update(
+        #     {
+        #         "fx": float(new_K[0, 0]),
+        #         "fy": float(new_K[1, 1]),
+        #         "cx": float(new_K[0, 2]),
+        #         "cy": float(new_K[1, 2]),
+        #         "width": undistorted_rgb.shape[1],
+        #         "height": undistorted_rgb.shape[0],
+        #     }
+        # )
 
-        return undistorted_rgb, overrides
+        # return undistorted_rgb, overrides
     
     def _resize_image(self, image_tensor, max_size=100):
         """Resize image for display in frustum.
