@@ -239,8 +239,8 @@ class PandaSet(ADDataParser):
                 heights.append(1080 - (250 if camera == "back_camera" else 0))
 
         intrinsics = torch.tensor(np.array(intrinsics), dtype=torch.float32)
-        # poses = torch.tensor(np.array(poses), dtype=torch.float32)
-        poses = torch.stack(poses, dim=0).to(torch.float32)
+        poses = torch.tensor(np.array(poses), dtype=torch.float32)
+        # poses = torch.stack(poses, dim=0).to(torch.float32)
         times = torch.tensor(times, dtype=torch.float64)  # need higher precision
         idxs = torch.tensor(idxs).int().unsqueeze(-1)
         cameras = Cameras(
