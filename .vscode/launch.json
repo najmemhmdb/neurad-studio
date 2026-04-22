@@ -41,10 +41,21 @@
         "--pipeline.datamanager.eval-num-lidar-rays-per-batch=128",
         "--pipeline.datamanager.train_num_rays_per_batch=4096",
         "--pipeline.datamanager.eval_num_rays_per_batch=4096",
-        "--pipeline.model.camera-optimizer.mode=SO3xR3",
-        "pandaset-data",
+        // "--pipeline.model.camera-optimizer.mode=SO3xR3",
+        "simulator-data",
         "--dataset_end_fraction=1.0",
-        "--cameras=all"
+        // "--cameras=all"
+      ]
+    },
+    {
+      "name": "Python: simulator visualizer",
+      "type": "python",
+      "request": "launch",
+      "program": "nerfstudio/scripts/viewer/visualize_dataparser.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--data=./data/pandaset"
       ]
     },
     {
