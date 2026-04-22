@@ -130,7 +130,6 @@ class SimulatorDataParserConfig(ADDataParserConfig):
     stationary_displacement_threshold: float = STATIONARY_DISPLACEMENT_THRESHOLD
     """Minimum translation (m) for an actor to be considered dynamic."""
 
-    """The distortion parameters for the cameras."""
     def __post_init__(self):
         """Validate that at least one camera and one lidar are specified."""
         # Don't call parent __post_init__ as it converts "none" to empty tuples
@@ -478,7 +477,6 @@ class SimulatorDataParser(ADDataParser):
         widths = []
         times = []
         filenames = []
-        distortion_params = []
         idxs = []
         cameras = list(self.config.cameras)
         if self.config.end_frame is None:
@@ -591,7 +589,6 @@ class SimulatorDataParser(ADDataParser):
         for i, filepath in enumerate(filenames):
             lidar = lidars[i]
             pcd_data = PointCloud.from_path(str(filepath)).pc_data
-            l2w = pose_utils.to4x4(lidar.lidar_to_worlds)
             points = pd.DataFrame(pcd_data).to_numpy()
             xyz = points[:, :3]  # N x 3
             intensity = points[:, 3] # N x 1 

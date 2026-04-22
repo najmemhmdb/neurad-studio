@@ -209,11 +209,11 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             for camera in cameras:
                 curr_cam = self.sequence.camera[camera]
-                interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
-                extrinsic_l2cam = self.extrinsics[camera]
-                extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
-                extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
-                l2cam = _pandaset_pose_to_matrix(extrinsic_l2cam) 
+                # interpolated_l2w = pose_utils.vectorized_interpolate(l2ws, times_lidar, torch.tensor([curr_cam.timestamps[i]], dtype=torch.float64))
+                # extrinsic_l2cam = self.extrinsics[camera]
+                # extrinsic_l2cam["position"] = extrinsic_l2cam["extrinsic"]["transform"]["translation"]
+                # extrinsic_l2cam["heading"] = extrinsic_l2cam["extrinsic"]["transform"]["rotation"]
+                # l2cam = _pandaset_pose_to_matrix(extrinsic_l2cam) 
                 
                 
                 file_path = curr_cam._data_structure[i]
