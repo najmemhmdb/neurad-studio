@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
-
+from matplotlib import pyplot as plt
 import cv2
 import numpy as np
 import torch
@@ -130,7 +130,7 @@ class VisualizerConfig:
     max_projection_points: Optional[int] = 150000
     """Maximum number of lidar points kept for camera projection diagnostics (None = all)."""
 
-    projection_point_radius_px: int = 2
+    projection_point_radius_px: int = 1
     """Radius (in pixels) for projected LiDAR points when overlayed on images."""
     
     projection_preview_max_dim: int = 800
@@ -168,6 +168,7 @@ class DataParserVisualizer:
         CONSOLE.print(f"[bold green]Loading dataparser from {config.data}")
         dataparser_config = SimulatorDataParserConfig(
             data=config.data,
+            # sequence="028",
             agent_id=config.agent_id,
             start_frame=config.start_frame,
             end_frame=config.end_frame,
@@ -573,18 +574,22 @@ class DataParserVisualizer:
         time_diffs = torch.abs(self._lidar_timestamps - camera_time)
         nearest_idx = torch.argmin(time_diffs).item()
         nearest_time = self._lidar_timestamps[nearest_idx].item()
-        
+        interpolated_l2w = self._lidar_poses[nearest_idx]
         # Interpolate lidar pose at camera timestamp
-        from nerfstudio.utils.poses import vectorized_interpolate
-        query_time = torch.tensor([[camera_time]], dtype=torch.float64)
-        interpolated_l2w = vectorized_interpolate(
-            self._lidar_poses,
-            self._lidar_timestamps.unsqueeze(-1),
-            query_time
-        ).squeeze(0)  # [3, 4]
+        # from nerfstudio.utils.poses import vectorized_interpolate
+        # query_time = torch.tensor([[camera_time]], dtype=torch.float64)
+        # interpolated_l2w = vectorized_interpolate(
+        #     self._lidar_poses,
+        #     self._lidar_timestamps.unsqueeze(-1),
+        #     query_time
+        # ).squeeze(0)  # [3, 4]
         
         # Get the nearest lidar point cloud (in lidar frame)
         point_cloud_lidar = self._lidar_point_clouds[nearest_idx]
+        # dist_thresh = torch.tensor((1.0, 2.0, 2.0))
+        # for i, pc in enumerate(point_cloud_lidar):
+        #     mask = (pc[:, :3].abs() >= dist_thresh).any(-1)
+        #     point_clouds[i] = pc[mask]
         
         # Downsample if needed
         if self.config.max_projection_points is not None and point_cloud_lidar.shape[0] > self.config.max_projection_points:
@@ -593,9 +598,12 @@ class DataParserVisualizer:
         
         # Transform points from lidar frame to world frame using interpolated pose
         # transform_points only transforms xyz (first 3 columns), preserving other columns like intensity
-        from nerfstudio.cameras.lidars import transform_points
-        point_cloud_world = transform_points(point_cloud_lidar, interpolated_l2w.unsqueeze(0)).squeeze(0)
-        
+        # from nerfstudio.cameras.lidars import transform_points
+        # point_cloud_world = transform_points(point_cloud_lidar, interpolated_l2w.unsqueeze(0)).squeeze(0)
+        point_cloud_world = point_cloud_lidar.clone()
+        R = interpolated_l2w[:3, :3]
+        t = interpolated_l2w[:3, 3]
+        point_cloud_world[:, :3] = (point_cloud_lidar[:, :3] @ R.T) + t
         # Extract intensities (if available) - these will be indexed by sequential indices after filtering
         intensities = None
         if point_cloud_world.shape[1] > 3:
@@ -773,7 +781,7 @@ class DataParserVisualizer:
         image_np = (image_tensor.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
         pil_image = Image.fromarray(image_np)
         draw = ImageDraw.Draw(pil_image)
-        radius = max(1, self.config.projection_point_radius_px)
+        radius = max(0.2, self.config.projection_point_radius_px)
         for x, y, color in zip(px.tolist(), py.tolist(), colors.tolist()):
             x0 = max(0, x - radius)
             y0 = max(0, y - radius)
@@ -833,8 +841,11 @@ class DataParserVisualizer:
 
         points_world = projection_points[:, :3].float()
         # Transform points from world to camera coordinates using transform_points for consistency
-        from nerfstudio.cameras.lidars import transform_points
-        cam_points = transform_points(points_world, w2c.unsqueeze(0)).squeeze(0)
+        # from nerfstudio.cameras.lidars import transform_points
+        # cam_points = transform_points(points_world, w2c.unsqueeze(0)).squeeze(0)
+        R = w2c[:3, :3]
+        t = w2c[:3, 3]
+        cam_points = (points_world @ R.T) + t
 
         # Check if points are in front of camera (in NeRF Studio: forward = -Z, so valid points have Z < 0)
         valid_points = cam_points[:, 2] < 0
@@ -894,15 +905,12 @@ class DataParserVisualizer:
 
         # Use intensities from the lidar scan
         # color_indices are sequential indices into the filtered point cloud (after valid_points and depth_mask)
-        # So we can use them directly to index into intensities
-        if intensities is not None:
-            # color_indices are indices into the filtered intensities array
-            intensities_filtered = intensities[color_indices].cpu().numpy()
-            colors = (intensity_to_rgb(intensities_filtered) * 255).astype(np.uint8)
-        else:
-            # Fallback: use default color if no intensities
-            colors = np.full((len(color_indices), 3), 255, dtype=np.uint8)
-
+        depth_vals = depths[bounds_mask].cpu().numpy()
+        depth_min = np.percentile(depth_vals, 5)
+        depth_max = np.percentile(depth_vals, 95)
+        depth_norm = (depth_vals - depth_min) / (depth_max - depth_min + 1e-6)
+        depth_norm = np.clip(depth_norm, 0.0, 1.0)
+        colors = (plt.cm.turbo(depth_norm)[:, :3] * 255).astype(np.uint8)
         markdown_image = self._render_projection_preview(image_tensor, u, v, colors)
         self._set_projection_image(markdown_image)
         num_points = len(color_indices)
@@ -1186,7 +1194,11 @@ class DataParserVisualizer:
             self._lidar_point_clouds.append(point_cloud.cpu())
             
             # Transform and visualize point cloud (for 3D visualization)
-            point_cloud_world = transform_points(point_cloud, l2w_tensor.unsqueeze(0)).squeeze(0)
+            # point_cloud_world = transform_points(point_cloud, l2w_tensor.unsqueeze(0)).squeeze(0)
+            point_cloud_world = point_cloud.clone()
+            R = l2w_tensor[:3, :3]
+            t = l2w_tensor[:3, 3]
+            point_cloud_world[:, :3] = (point_cloud[:, :3] @ R.T) + t
             self._accumulate_projection_points(point_cloud_world)
             
             # Downsample if needed

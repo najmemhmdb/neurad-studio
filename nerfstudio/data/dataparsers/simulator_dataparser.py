@@ -74,11 +74,11 @@ ALLOWED_DEFORMABLE_CLASSES = {
     "TYPE_UNKNOWN",  # Might be pedestrian
 }
 
-SIMULATOR_TO_OPENCV = np.array(
+SIM_FROM_OPENCV = np.array(
     [
-        [0, 0, 1],
+        [0, 0, -1],
         [-1, 0, 0],
-        [0, -1, 0],
+        [0, 1, 0],
     ]
 )
 LANE_SHIFT_SIGN: Dict[str, Literal[-1, 1]] = defaultdict(lambda: -1)
@@ -188,6 +188,7 @@ class SimulatorDataParser(ADDataParser):
         self.streams_data = self.label_data.get("openlabel", {}).get("streams", {})
         self.sensor_params = self.label_data.get("openlabel", {}).get("coordinate_systems", {})
         
+
         # Pre-compute ego poses cache for all frames
         # self._ego_poses_cache: Dict[float, np.ndarray] = {}
         # Cache for ground truth files
@@ -197,6 +198,219 @@ class SimulatorDataParser(ADDataParser):
         # output_path = Path("ego_poses.json")
 
     
+    def _get_lane_shift_sign(self, sequence: str) -> Literal[-1, 1]:
+        return LANE_SHIFT_SIGN.get(sequence, 1)
+    
+    def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
+        """Returns camera info and image filenames."""
+        poses = []
+        intrinsics = []
+        heights = []
+        widths = []
+        times = []
+        filenames = []
+        idxs = []
+        WORLD_FIX = np.diag([-1, 1, -1, 1])
+        cameras = list(self.config.cameras)
+        if self.config.end_frame is None:
+            end_frame = len(self.frames_data)
+        else:
+            end_frame = self.config.end_frame
+        
+        for frame_id in self.frames_data.keys():
+            if int(frame_id) < self.config.start_frame or int(frame_id) >= end_frame:
+                continue
+            
+            frame_data = self.frames_data[frame_id]
+            transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
+            ego_to_world = np.linalg.inv(openlabel_to_matrix(transform_src_to_dst))
+            for camera_id in self.config.cameras:
+                sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{camera_id}_cs"]["pose_wrt_parent"]
+                sensor_in_ego = openlabel_to_matrix(sensor_in_ego_dict)
+
+                sensor_in_ego[:3, :3] = sensor_in_ego[:3, :3] @ SIM_FROM_OPENCV
+                pose = ego_to_world @ sensor_in_ego 
+                pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
+                # pose = WORLD_FIX @ pose
+                poses.append(pose[:3, :4])
+                intrinsic = self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["intrinsics_custom"]["camera_parameters"]
+                fx = intrinsic.get("fx", 621.5469613259668)
+                fy = intrinsic.get("fy", 621.2686567164179)
+                cx = intrinsic.get("cx", 600.0)
+                cy = intrinsic.get("cy", 388.5)
+                intrinsic_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+                intrinsics.append(intrinsic_matrix)
+                uri =  self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"vehicle_10010/{camera_id}"]["uri"]
+                filenames.append(uri)
+                times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
+                idxs.append(cameras.index(camera_id))
+                heights.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["height"] - (250 if camera_id == "camera_1" else 0))
+                widths.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["width"])
+
+        # Convert to tensors
+        intrinsics = torch.from_numpy(np.array(intrinsics)).float()
+        poses = torch.tensor(np.array(poses), dtype=torch.float32)
+        times = torch.tensor(times, dtype=torch.float64)
+        idxs = torch.tensor(idxs).int().unsqueeze(-1)
+        heights = torch.tensor(heights).int()
+        widths = torch.tensor(widths).int()
+        cameras = Cameras(
+            fx=intrinsics[:, 0, 0],
+            fy=intrinsics[:, 1, 1],
+            cx=intrinsics[:, 0, 2],
+            cy=intrinsics[:, 1, 2],
+            height=heights,
+            width=widths,
+            camera_to_worlds=poses,
+            camera_type=CameraType.PERSPECTIVE,
+            times=times,
+            metadata={"sensor_idxs": idxs},
+        )
+        return cameras, filenames
+
+    
+    def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
+        """Returns lidar info and filenames."""
+        poses = []
+        times = []
+        filenames = []
+        idxs = []
+        WORLD_FIX = np.diag([-1, 1, -1, 1])
+        SIM_FROM_LIDAR_POINTS = np.eye(4)
+        SIM_FROM_LIDAR_POINTS[:3, :3] = np.array([
+            [-1, 0,  0],
+            [ 0, 1,  0],
+            [ 0, 0, -1],
+        ])
+        if self.config.end_frame is None:
+            end_frame = len(self.frames_data)
+        else:
+            end_frame = self.config.end_frame
+        
+        for frame_id in self.frames_data.keys():
+            if int(frame_id) < self.config.start_frame or int(frame_id) >= end_frame:
+                continue
+
+            frame_data = self.frames_data[frame_id]
+            transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
+            ego_to_world = np.linalg.inv(openlabel_to_matrix(transform_src_to_dst))
+            for lidar_id in self.config.lidars:
+                sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{lidar_id}_cs"]["pose_wrt_parent"]
+                sensor_in_ego = openlabel_to_matrix(sensor_in_ego_dict)
+                pose = ego_to_world @ sensor_in_ego 
+                # pose = WORLD_FIX @ pose
+                poses.append(torch.from_numpy(pose[:3, :4]).float())
+                times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
+                uri = self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"vehicle_10010/{lidar_id}"]["uri"]
+                filenames.append(str(uri).replace("vehicle_10010/lidar_1/velodyne_vlp_128/", ""))
+                idxs.append(list(self.config.lidars).index(lidar_id))
+        
+        
+        poses = torch.stack(poses)
+        times = torch.tensor(times, dtype=torch.float64)  # need higher precision
+        idxs = torch.tensor(idxs).int().unsqueeze(-1)
+
+        lidars = Lidars(
+            lidar_to_worlds=poses[:, :3, :4],
+            lidar_type=LidarType.VELODYNE128,
+            times=times,
+            metadata={"sensor_idxs": idxs},
+            horizontal_beam_divergence=HORIZONTAL_BEAM_DIVERGENCE,
+            vertical_beam_divergence=VERTICAL_BEAM_DIVERGENCE,
+            valid_lidar_distance_threshold=DUMMY_DISTANCE_VALUE / 2,
+        )
+        
+        return lidars, filenames
+
+
+    def _read_lidars(self, lidars: Lidars, filenames: List[Path]) -> List[torch.Tensor]:
+        """Reads the point clouds from the given filenames."""
+        point_clouds = []
+
+        for i, filepath in enumerate(filenames):
+            lidar = lidars[i]
+            pcd_data = PointCloud.from_path(str(filepath)).pc_data
+            points = pd.DataFrame(pcd_data).to_numpy()
+            xyz = points[:, :3]  # N x 3
+            intensity = points[:, 3] # N x 1 
+            intensity /= MAX_REFLECTANCE_VALUE  # N,
+            t = get_mock_timestamps(xyz)  # N, relative timestamps
+            pc = np.hstack((xyz, intensity[:, None], t[:, None]))
+            point_clouds.append(torch.from_numpy(pc).float())
+
+        lidars.lidar_to_worlds = lidars.lidar_to_worlds.float()
+        return point_clouds
+
+
+    def _get_actor_trajectories(self) -> List[Dict]:
+        """Returns a list of actor trajectories from label file."""
+        trajectories = []
+        
+        # Group objects by ID across frames
+        object_trajectories: Dict[str, List[Tuple[float, np.ndarray, np.ndarray, str]]] = defaultdict(list)
+        
+        for frame_id, frame_data in self.frames_data.items():
+            frame_props = frame_data.get("frame_properties", {})
+            timestamp = frame_props.get("timestamp", None)
+            
+            
+            objects = frame_data.get("objects", {})
+            
+            for obj_id, obj_data in objects.items():
+                obj_type = obj_data.get("object_data", {}).get("type", "")
+                cuboid = obj_data.get("object_data", {}).get("cuboid", {})
+                cuboid_value = cuboid.get("value", [])
+            
+                pose, dims = cuboid_to_pose_and_dims(cuboid_value)
+                object_trajectories[obj_id].append((timestamp, pose, dims, obj_type))
+        
+        # Convert to trajectory format
+        for obj_id, traj_data in object_trajectories.items():
+            if len(traj_data) < 2:
+                continue  # Need at least 2 timestamps for trajectory
+            
+            # Sort by timestamp
+            traj_data.sort(key=lambda x: x[0])
+            
+            timestamps = torch.tensor([t[0] for t in traj_data], dtype=torch.float64)
+            pose_list = [t[1] for t in traj_data]
+            poses = torch.tensor(pose_list, dtype=torch.float32)
+            dims_list = [t[2] for t in traj_data]
+            obj_type = traj_data[0][3]
+            
+            # Use average dimensions
+            dims = np.mean(dims_list, axis=0)
+            dims = torch.tensor(dims, dtype=torch.float32)
+            
+            # Determine properties
+            positions = np.array([pose[:3, 3] for pose in pose_list])
+            displacement = np.linalg.norm(positions[-1] - positions[0])
+            is_stationary = displacement < self.stationary_displacement_threshold
+            is_rigid = obj_type in ALLOWED_RIGID_CLASSES
+            is_deformable = obj_type in ALLOWED_DEFORMABLE_CLASSES
+            is_symmetric = obj_type in {
+                "TYPE_VEHICLE",
+                "TYPE_SMALL_CAR",
+                "TYPE_MEDIUM_CAR",
+                "TYPE_COMPACT_CAR",
+                "TYPE_LUXURY_CAR",
+            }
+            
+            trajectories.append(
+                {
+                    "poses": poses,
+                    "timestamps": timestamps,
+                    "dims": dims,
+                    "label": obj_type,
+                    "stationary": is_stationary,
+                    "symmetric": is_symmetric,
+                    "deformable": is_deformable,
+                    "is_ego": obj_id == self.ego_object_id,
+                    "object_id": obj_id,
+                }
+            )
+        
+        return trajectories
 
     # def _load_ego_file(self, camera_id: str, timestamp: float) -> Optional[Dict]:
     #     """Load ego file with caching."""
@@ -466,211 +680,7 @@ class SimulatorDataParser(ADDataParser):
         
     #     raise ValueError(f"No ego pose available for timestamp {timestamp}")
 
-    def _get_lane_shift_sign(self, sequence: str) -> Literal[-1, 1]:
-        return LANE_SHIFT_SIGN.get(sequence, 1)
     
-    def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
-        """Returns camera info and image filenames."""
-        poses = []
-        intrinsics = []
-        heights = []
-        widths = []
-        times = []
-        filenames = []
-        idxs = []
-        cameras = list(self.config.cameras)
-        if self.config.end_frame is None:
-            end_frame = len(self.frames_data)
-        else:
-            end_frame = self.config.end_frame
-        
-        for frame_id in self.frames_data.keys():
-            if int(frame_id) < self.config.start_frame or int(frame_id) >= end_frame:
-                continue
-            
-            frame_data = self.frames_data[frame_id]
-            transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
-            ego_to_world = np.linalg.inv(openlabel_to_matrix(transform_src_to_dst))
-            for camera_id in self.config.cameras:
-                sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{camera_id}_cs"]["pose_wrt_parent"]
-                sensor_in_ego = np.linalg.inv(openlabel_to_matrix(sensor_in_ego_dict))
-
-                sensor_in_ego[:3, :3] = sensor_in_ego[:3, :3] @ SIMULATOR_TO_OPENCV
-                pose = ego_to_world @ sensor_in_ego 
-                pose[:3, :3] = pose[:3, :3] @ OPENCV_TO_NERFSTUDIO
-                poses.append(pose[:3, :4])
-                intrinsic = self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["intrinsics_custom"]["camera_parameters"]
-                fx = intrinsic.get("fx", 621.5469613259668)
-                fy = intrinsic.get("fy", 621.2686567164179)
-                cx = intrinsic.get("cx", 600.0)
-                cy = intrinsic.get("cy", 388.5)
-                intrinsic_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-                intrinsics.append(intrinsic_matrix)
-                uri =  self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"vehicle_10010/{camera_id}"]["uri"]
-                filenames.append(uri)
-                times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
-                idxs.append(cameras.index(camera_id))
-                heights.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["height"] - (250 if camera_id == "camera_1" else 0))
-                widths.append(self.streams_data[f"vehicle_10010/{camera_id}"]["stream_properties"]["width"])
-
-        # Convert to tensors
-        intrinsics = torch.from_numpy(np.array(intrinsics)).float()
-        poses = torch.tensor(np.array(poses), dtype=torch.float32)
-        times = torch.tensor(times, dtype=torch.float64)
-        idxs = torch.tensor(idxs).int().unsqueeze(-1)
-        heights = torch.tensor(heights).int()
-        widths = torch.tensor(widths).int()
-        cameras = Cameras(
-            fx=intrinsics[:, 0, 0],
-            fy=intrinsics[:, 1, 1],
-            cx=intrinsics[:, 0, 2],
-            cy=intrinsics[:, 1, 2],
-            height=heights,
-            width=widths,
-            camera_to_worlds=poses,
-            camera_type=CameraType.PERSPECTIVE,
-            times=times,
-            metadata={"sensor_idxs": idxs},
-        )
-        return cameras, filenames
-
-    
-    def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
-        """Returns lidar info and filenames."""
-        poses = []
-        times = []
-        filenames = []
-        idxs = []
-
-        if self.config.end_frame is None:
-            end_frame = len(self.frames_data)
-        else:
-            end_frame = self.config.end_frame
-        
-        for frame_id in self.frames_data.keys():
-            if int(frame_id) < self.config.start_frame or int(frame_id) >= end_frame:
-                continue
-
-            frame_data = self.frames_data[frame_id]
-            transform_src_to_dst = frame_data["frame_properties"]["transforms"]["scene_to_vehicle_10010_local"]["transform_src_to_dst"]
-            ego_to_world = np.linalg.inv(openlabel_to_matrix(transform_src_to_dst))
-            for lidar_id in self.config.lidars:
-                sensor_in_ego_dict = self.sensor_params[f"vehicle_10010/{lidar_id}_cs"]["pose_wrt_parent"]
-                sensor_in_ego = np.linalg.inv(openlabel_to_matrix(sensor_in_ego_dict))
-                pose = ego_to_world @ sensor_in_ego
-                poses.append(torch.from_numpy(pose[:3, :4]).float())
-                times.append(self.frames_data[frame_id]["frame_properties"]["timestamp"])
-                uri = self.config.data / self.frames_data[frame_id]["frame_properties"]["streams"][f"vehicle_10010/{lidar_id}"]["uri"]
-                filenames.append(str(uri).replace("vehicle_10010/lidar_1/velodyne_vlp_128/", ""))
-                idxs.append(list(self.config.lidars).index(lidar_id))
-        
-        
-        poses = torch.stack(poses)
-        times = torch.tensor(times, dtype=torch.float64)  # need higher precision
-        idxs = torch.tensor(idxs).int().unsqueeze(-1)
-
-        lidars = Lidars(
-            lidar_to_worlds=poses[:, :3, :4],
-            lidar_type=LidarType.VELODYNE128,
-            times=times,
-            metadata={"sensor_idxs": idxs},
-            horizontal_beam_divergence=HORIZONTAL_BEAM_DIVERGENCE,
-            vertical_beam_divergence=VERTICAL_BEAM_DIVERGENCE,
-            valid_lidar_distance_threshold=DUMMY_DISTANCE_VALUE / 2,
-        )
-        
-        return lidars, filenames
-
-
-    def _read_lidars(self, lidars: Lidars, filenames: List[Path]) -> List[torch.Tensor]:
-        """Reads the point clouds from the given filenames."""
-        point_clouds = []
-
-        for i, filepath in enumerate(filenames):
-            lidar = lidars[i]
-            pcd_data = PointCloud.from_path(str(filepath)).pc_data
-            points = pd.DataFrame(pcd_data).to_numpy()
-            xyz = points[:, :3]  # N x 3
-            intensity = points[:, 3] # N x 1 
-            intensity /= MAX_REFLECTANCE_VALUE  # N,
-            t = get_mock_timestamps(xyz)  # N, relative timestamps
-            pc = np.hstack((xyz, intensity[:, None], t[:, None]))
-            point_clouds.append(torch.from_numpy(pc).float())
-
-        lidars.lidar_to_worlds = lidars.lidar_to_worlds.float()
-        return point_clouds
-
-
-    def _get_actor_trajectories(self) -> List[Dict]:
-        """Returns a list of actor trajectories from label file."""
-        trajectories = []
-        
-        # Group objects by ID across frames
-        object_trajectories: Dict[str, List[Tuple[float, np.ndarray, np.ndarray, str]]] = defaultdict(list)
-        
-        for frame_id, frame_data in self.frames_data.items():
-            frame_props = frame_data.get("frame_properties", {})
-            timestamp = frame_props.get("timestamp", None)
-            
-            
-            objects = frame_data.get("objects", {})
-            
-            for obj_id, obj_data in objects.items():
-                obj_type = obj_data.get("object_data", {}).get("type", "")
-                cuboid = obj_data.get("object_data", {}).get("cuboid", {})
-                cuboid_value = cuboid.get("value", [])
-            
-                pose, dims = cuboid_to_pose_and_dims(cuboid_value)
-                object_trajectories[obj_id].append((timestamp, pose, dims, obj_type))
-        
-        # Convert to trajectory format
-        for obj_id, traj_data in object_trajectories.items():
-            if len(traj_data) < 2:
-                continue  # Need at least 2 timestamps for trajectory
-            
-            # Sort by timestamp
-            traj_data.sort(key=lambda x: x[0])
-            
-            timestamps = torch.tensor([t[0] for t in traj_data], dtype=torch.float64)
-            pose_list = [t[1] for t in traj_data]
-            poses = torch.tensor(pose_list, dtype=torch.float32)
-            dims_list = [t[2] for t in traj_data]
-            obj_type = traj_data[0][3]
-            
-            # Use average dimensions
-            dims = np.mean(dims_list, axis=0)
-            dims = torch.tensor(dims, dtype=torch.float32)
-            
-            # Determine properties
-            positions = np.array([pose[:3, 3] for pose in pose_list])
-            displacement = np.linalg.norm(positions[-1] - positions[0])
-            is_stationary = displacement < self.stationary_displacement_threshold
-            is_rigid = obj_type in ALLOWED_RIGID_CLASSES
-            is_deformable = obj_type in ALLOWED_DEFORMABLE_CLASSES
-            is_symmetric = obj_type in {
-                "TYPE_VEHICLE",
-                "TYPE_SMALL_CAR",
-                "TYPE_MEDIUM_CAR",
-                "TYPE_COMPACT_CAR",
-                "TYPE_LUXURY_CAR",
-            }
-            
-            trajectories.append(
-                {
-                    "poses": poses,
-                    "timestamps": timestamps,
-                    "dims": dims,
-                    "label": obj_type,
-                    "stationary": is_stationary,
-                    "symmetric": is_symmetric,
-                    "deformable": is_deformable,
-                    "is_ego": obj_id == self.ego_object_id,
-                    "object_id": obj_id,
-                }
-            )
-        
-        return trajectories
-
 
 
 def cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.ndarray]:
@@ -695,6 +705,31 @@ def cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.n
     
     return pose, dims
 
+def get_mock_timestamps(points: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+    """Get mock relative timestamps for the velodyne points."""
+    # the velodyne has x forward, y left, z up and the sweep is split behind the car.
+    # it is also rotating counter-clockwise, meaning that the angles close to -pi are the
+    # first ones in the sweep and the ones close to pi are the last ones in the sweep.
+    angles = np.arctan2(points[:, 1], points[:, 0])  # N, [-pi, pi]
+    angles += np.pi  # N, [0, 2pi]
+    # see how much of the rotation have finished
+    fraction_of_rotation = angles / (2 * np.pi)  # N, [0, 1]
+    # get the pseudo timestamps based on the total rotation time
+    timestamps = fraction_of_rotation * LIDAR_ROTATION_TIME
+    return timestamps
+
+
+def openlabel_to_matrix(pose_dict):
+    qx, qy, qz, qw = pose_dict["quaternion"]
+    quat = pyquaternion.Quaternion(w=qw, x=qx, y=qy, z=qz)
+    rot_matrix = quat.rotation_matrix
+
+    T = np.eye(4)
+    T[:3, :3] = rot_matrix
+    T[:3, 3] = pose_dict["translation"]
+    return T
+
+
 # def _euler_to_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
 #     """Convert Euler angles (roll, pitch, yaw) to rotation matrix"""
 #     r = R.from_euler("xyz", [roll, pitch, yaw], degrees=False)
@@ -716,18 +751,6 @@ def cuboid_to_pose_and_dims(cuboid_value: List[float]) -> Tuple[np.ndarray, np.n
 #     pose[:3, 3] = [x, y, z]
 #     return pose
 
-def get_mock_timestamps(points: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
-    """Get mock relative timestamps for the velodyne points."""
-    # the velodyne has x forward, y left, z up and the sweep is split behind the car.
-    # it is also rotating counter-clockwise, meaning that the angles close to -pi are the
-    # first ones in the sweep and the ones close to pi are the last ones in the sweep.
-    angles = np.arctan2(points[:, 1], points[:, 0])  # N, [-pi, pi]
-    angles += np.pi  # N, [0, 2pi]
-    # see how much of the rotation have finished
-    fraction_of_rotation = angles / (2 * np.pi)  # N, [0, 1]
-    # get the pseudo timestamps based on the total rotation time
-    timestamps = fraction_of_rotation * LIDAR_ROTATION_TIME
-    return timestamps
 
 
 
@@ -774,13 +797,3 @@ def get_mock_timestamps(points: npt.NDArray[np.float32]) -> npt.NDArray[np.float
 #     T_mean[:3, 3] = t_mean
 #     return T_mean
 
-
-def openlabel_to_matrix(pose_dict):
-    qx, qy, qz, qw = pose_dict["quaternion"]
-    quat = pyquaternion.Quaternion(w=qw, x=qx, y=qy, z=qz)
-    rot_matrix = quat.rotation_matrix
-
-    T = np.eye(4)
-    T[:3, :3] = rot_matrix
-    T[:3, 3] = pose_dict["translation"]
-    return T
