@@ -25,7 +25,7 @@ from typing import Dict, Union
 
 import tyro
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, ScaledCameraOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig, ScaledCameraOptimizerConfig, CameraLidarTemporalOptimizerConfig
 from nerfstudio.configs.base_config import LoggingConfig, ViewerConfig
 from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
 from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
@@ -33,7 +33,7 @@ from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatama
 from nerfstudio.data.datamanagers.full_images_lidar_datamanager import FullImageLidarDatamanagerConfig
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManagerConfig
 from nerfstudio.data.dataparsers.pandaset_dataparser import PandaSetDataParserConfig
-from nerfstudio.engine.optimizers import AdamOptimizerConfig, AdamWOptimizerConfig, RAdamOptimizerConfig
+from nerfstudio.engine.optimizers import AdamOptimizerConfig, AdamWOptimizerConfig, RAdamOptimizerConfig, CustomAdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.models.lidar_nerfacto import LidarNerfactoModelConfig
@@ -404,7 +404,7 @@ method_configs["neurad"] = TrainerConfig(
         datamanager=ADDataManagerConfig(dataparser=PandaSetDataParserConfig(add_missing_points=True)),
         model=NeuRADModelConfig(
             eval_num_rays_per_chunk=1 << 15,
-            camera_optimizer=CameraOptimizerConfig(mode="off"),  # SO3xR3
+            camera_optimizer=CameraLidarTemporalOptimizerConfig(mode="off"),  # SO3xR3
         ),
     ),
     optimizers={
@@ -423,10 +423,14 @@ method_configs["neurad"] = TrainerConfig(
         "hashgrids": {
             "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
+        },        
+        "camera_opt_trans": {
+            "optimizer": CustomAdamOptimizerConfig(lr=1e-3, eps=1e-15), # 1e-3
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=20001, warmup_steps=2000),
         },
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-5, max_steps=20001, warmup_steps=2500),
+        "camera_opt_rot": {
+            "optimizer": CustomAdamOptimizerConfig(lr=1e-5, eps=1e-15), # 1e-4
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=20001, warmup_steps=2000),
         },
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
