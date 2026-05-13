@@ -1159,3 +1159,49 @@ def fisheye624_unproject(coords: torch.Tensor, distortion_params: torch.Tensor) 
     dirs[..., 1] = -dirs[..., 1]
     dirs[..., 2] = -dirs[..., 2]
     return dirs
+
+
+
+
+def yaw_rotation_function(yaw_rad: float) -> Tensor:
+    """Create a rotation matrix with specified yaw angle"""
+    yaw_rotation = torch.tensor([
+        [math.cos(yaw_rad), -math.sin(yaw_rad), 0],
+        [math.sin(yaw_rad), math.cos(yaw_rad), 0],
+        [0, 0, 1]
+    ], dtype=torch.float32)
+
+    l2cam = torch.tensor([
+        [-1, 0, 0],
+        [0, 0, -1],
+        [0, -1, 0]
+    ], dtype=torch.float32)
+
+    return l2cam @ yaw_rotation
+
+
+
+
+def rotation_matrix_difference_angle_trace(R1, R2):
+    """
+    Fastest method for PyTorch CUDA.
+    Returns angle in radians [0, pi]
+    """
+    # Compute relative rotation: R2 @ R1.T
+    R_diff = R2 @ R1.transpose(-2, -1)
+    return rotation_angle_diff(R_diff)
+    
+
+
+def rotation_angle_diff(R_diff):
+    # Trace method: θ = arccos((trace(R) - 1) / 2)
+    trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)
+    
+    # Clamp for numerical stability
+    cos_angle = (trace - 1) / 2
+    cos_angle = cos_angle.clamp(-1.0, 1.0)
+    
+    # Compute angle
+    angle = torch.acos(cos_angle)
+    
+    return angle
