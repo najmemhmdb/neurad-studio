@@ -114,3 +114,94 @@ def exp_map_SE3(tangent_vector: Float[Tensor, "b 6"]) -> Float[Tensor, "b 3 4"]:
         tangent_vector_ang @ (tangent_vector_ang.transpose(1, 2) @ tangent_vector_lin)
     )
     return ret
+
+
+def mat4_to_SO3xR3_twist(T4x4: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a 4x4 transform to the 6D vector for exp_map_SO3xR3.
+    Returns xi = [t_x, t_y, t_z, phi_x, phi_y, phi_z] (shape [6]).
+    """
+    T4x4 = T4x4.to(dtype=torch.float64)
+    R = T4x4[:3, :3]
+    t = T4x4[:3, 3]
+    
+    # Project R to SO(3) if needed (important for numerical stability)
+    U, _, Vh = torch.linalg.svd(R)
+    R_proj = U @ Vh
+    if torch.det(R_proj) < 0:
+        U[:, -1] *= -1
+        R_proj = U @ Vh
+    
+    # Use standard log map consistent with exp_map_SO3xR3
+    phi = _rotmat_to_rotvec_consistent(R_proj)
+
+    return torch.cat([t, phi])
+
+def _rotmat_to_rotvec_consistent(R: torch.Tensor) -> torch.Tensor:
+    trace = torch.clamp(torch.trace(R), -1.0, 3.0)
+    cos_theta = (trace - 1.0) * 0.5
+    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+    theta = torch.acos(cos_theta)
+
+    eps_small = 1e-6
+    eps_pi = 1e-4  # tolerance around pi
+
+    if theta < eps_small:
+        # Small-angle approximation
+        rx = 0.5 * (R[2, 1] - R[1, 2])
+        ry = 0.5 * (R[0, 2] - R[2, 0])
+        rz = 0.5 * (R[1, 0] - R[0, 1])
+        phi = torch.stack([rx, ry, rz])
+
+    elif abs(theta - torch.pi) < eps_pi:
+        # Special handling for rotations close to 180 degrees
+        # See e.g. Shoemake / Graphics Gems or classic SO(3) log map implementations
+        R_diag = torch.diagonal(R)
+        axis_sq = (R_diag + 1.0) * 0.5  # components of axis^2
+
+        # Numerical safety
+        axis_sq = torch.clamp(axis_sq, min=0.0)
+
+        # Pick the largest diagonal entry to avoid division by small numbers
+        if axis_sq[0] >= axis_sq[1] and axis_sq[0] >= axis_sq[2]:
+            x = torch.sqrt(axis_sq[0])
+            y = R[0, 1] / (2.0 * x) if x > eps_small else 0.0
+            z = R[0, 2] / (2.0 * x) if x > eps_small else 0.0
+            axis = torch.stack([x, y, z])
+        elif axis_sq[1] >= axis_sq[0] and axis_sq[1] >= axis_sq[2]:
+            y = torch.sqrt(axis_sq[1])
+            x = R[0, 1] / (2.0 * y) if y > eps_small else 0.0
+            z = R[1, 2] / (2.0 * y) if y > eps_small else 0.0
+            axis = torch.stack([x, y, z])
+        else:
+            z = torch.sqrt(axis_sq[2])
+            x = R[0, 2] / (2.0 * z) if z > eps_small else 0.0
+            y = R[1, 2] / (2.0 * z) if z > eps_small else 0.0
+            axis = torch.stack([x, y, z])
+
+        axis = axis / axis.norm()
+        phi = axis * theta
+
+    else:
+        # Standard case: use antisymmetric part
+        axis = torch.stack([
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1],
+        ]) / (2.0 * torch.sin(theta))
+        phi = axis * theta
+
+    # Optional consistency check with exp map, and sign flip if needed:
+    test_twist = torch.cat([torch.zeros(3, dtype=R.dtype, device=R.device), phi]).unsqueeze(0)
+    R_recon = exp_map_SO3xR3(test_twist)[0, :3, :3]
+
+    if torch.norm(R_recon - R) > 1e-4:
+        phi_neg = -phi
+        test_twist_neg = torch.cat(
+            [torch.zeros(3, dtype=R.dtype, device=R.device), phi_neg]
+        ).unsqueeze(0)
+        R_recon_neg = exp_map_SO3xR3(test_twist_neg)[0, :3, :3]
+        if torch.norm(R_recon_neg - R) < torch.norm(R_recon - R):
+            phi = phi_neg
+
+    return phi
