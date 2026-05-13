@@ -957,7 +957,15 @@ class Cameras(TensorDataclass):
             del metadata["time_to_center_pixel"]  # it has served its purpose
             if "rs_direction" in metadata:
                 del metadata["rs_direction"]  # it has served its purpose
-
+                
+        # my modification
+        masked_c2w = self.camera_to_worlds[camera_indices].squeeze(1)
+        if camera_indices.shape[1] == 1:
+            metadata["s2w"] = masked_c2w.reshape(masked_c2w.shape[0], 12).squeeze(1)
+            
+        else:
+            metadata["s2w"] = masked_c2w.reshape(masked_c2w.shape[0], masked_c2w.shape[1], 12)
+           
         return RayBundle(
             origins=origins,
             directions=directions,
